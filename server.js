@@ -84,6 +84,30 @@ function getActualPorts(fields) {
 }
 
 /**
+ * Normalize date to YYYY-MM-DD if user entered MM/DD/YYYY
+ * - "12/06/2025" -> "2025-12-06"
+ * Leaves other formats untouched.
+ */
+function normalizeDateToYyyyMmDd(value) {
+  if (!value) return value;
+  const s = String(value).trim();
+
+  // Already YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // MM/DD/YYYY
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) {
+    const mm = String(parseInt(m[1], 10)).padStart(2, "0");
+    const dd = String(parseInt(m[2], 10)).padStart(2, "0");
+    const yyyy = m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  return s;
+}
+
+/**
  * Convert YYYY-MM-DD -> "YYYY Mon DD" to match Apify output cruise_date
  * Example: 2025-12-06 -> "2025 Dec 06"
  */
@@ -104,8 +128,6 @@ function toCruiseDateString(yyyyMmDd) {
 
 /**
  * Extract ports from Apify output "stop_#_text" fields.
- * stop_1_text: "Departing from Port Canaveral, Orlando, Florida"
- * stop_2_text: "Grand Turk Island, Cockburn Town, Turks and Caicos"
  */
 function extractPortsFromStops(obj) {
   const keys = Object.keys(obj).filter(
@@ -148,13 +170,13 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
     throw new Error("Missing APIFY_TOKEN or APIFY_TASK_ID in Render environment variables.");
   }
 
-  // ✅ Input keys based on what YOU pasted earlier from Apify input JSON
+  // ✅ Input keys based on your Apify input JSON
   const input = {
     cruise_line: cruiseLine || "",
-    end_date: sailDate,              // "2025-12-06"
+    end_date: sailDate,              // YYYY-MM-DD
     max_number_of_pages: 1,
     ship_name: shipName,
-    start_date: sailDate,            // "2025-12-06"
+    start_date: sailDate,            // YYYY-MM-DD
     cruise_length: "0",
     departure_port: "",
     destination: "0",
@@ -204,11 +226,11 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
 
   const candidates = items.filter((it) => {
     const ship = String(it.ship_name || "").trim().toLowerCase();
-    const cd = String(it.cruise_date || "").trim(); // e.g. "2025 Dec 06"
+    const cd = String(it.cruise_date || "").trim();
     return ship === targetShip && cd === targetCruiseDate;
   });
 
-  const chosen = candidates[0] || items[0]; // fallback so pilot doesn't break
+  const chosen = candidates[0] || items[0]; // fallback for pilot stability
 
   const ports = extractPortsFromStops(chosen);
 
@@ -237,10 +259,15 @@ app.post("/webhooks/order-paid", async (req, res) => {
   const firstItem = lineItems[0] || {};
   const fields = extractLineItemProperties(firstItem);
 
-  // Pull common fields (these must match your Uploadery field labels loosely)
+  // Pull common fields (these must match your input field labels loosely)
   const cruiseLine = getField(fields, "cruise line");
-  const shipName = getField(fields, "ship");
-  const sailDate = getField(fields, "sail date");
+
+  // ✅ Small improvement: match both "ship" and "ships"
+  const shipName = getField(fields, "ship") || getField(fields, "ships");
+
+  // ✅ Fix 2: normalize Sail Date to YYYY-MM-DD
+  let sailDate = getField(fields, "sail date");
+  sailDate = normalizeDateToYyyyMmDd(sailDate);
 
   // Determine override vs scrape
   const portsChanged =
@@ -298,7 +325,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     console.log("✅ Ports selected:", portsSource, finalPorts);
 
-    // Return 200 so Shopify considers it successful
     res.status(200).send("OK");
   } catch (err) {
     console.error("❌ Webhook error:", err);
@@ -311,7 +337,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
-    // Pilot choice: return 200 to avoid Shopify retry storms while you're iterating
+    // Pilot choice: avoid Shopify retry storms while iterating
     res.status(200).send("OK");
   }
 });
