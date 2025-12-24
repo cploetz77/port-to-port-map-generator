@@ -1,1 +1,13 @@
-package.json
+{
+  "name": "savvy-cruise-map-generator",
+  "version": "1.0.0",
+  "description": "Server for generating cruise route maps",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+
