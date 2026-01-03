@@ -296,8 +296,6 @@ function computeCenterZoom(coords, width, height, padding = 140) {
   const usableW = Math.max(1, width - padding * 2);
   const usableH = Math.max(1, height - padding * 2);
 
-  // This is only used to pick zoom. Mapbox rendering details can differ slightly,
-  // which is why we’ll “auto-pick” the best tile size later for dot placement.
   const tileSize = 512;
   const zoomX = Math.log2(usableW / (worldWidth * tileSize));
   const zoomY = Math.log2(usableH / (worldHeight * tileSize));
@@ -318,7 +316,7 @@ const SLATE = "2f3b45";
 
 /**
  * Build base map URL (route only — NO markers).
- * Returns { url, view } where view includes center/zoom and pixel dims used.
+ * Returns { url, view }
  */
 function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false }) {
   const token = process.env.MAPBOX_TOKEN;
@@ -333,7 +331,6 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
   const poly = encodePolylineLngLat(cleaned);
   const polyEnc = encodeURIComponent(poly);
 
-  // Two-layer route (halo + main)
   const routeHalo = `path-10+${SLATE}-0.18(${polyEnc})`;
   const routeMain = `path-5+${ROUTE_TEAL}-0.85(${polyEnc})`;
 
@@ -344,26 +341,22 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
 
   const url = `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
 
-  const pixelWidth = retina ? width * 2 : width;
-  const pixelHeight = retina ? height * 2 : height;
+  // IMPORTANT: these are *requested* pixels; actual PNG may differ.
+  const requestedPixelWidth = retina ? width * 2 : width;
+  const requestedPixelHeight = retina ? height * 2 : height;
 
   return {
     url,
-    view: { centerLng, centerLat, zoom, pixelWidth, pixelHeight }
+    view: { centerLng, centerLat, zoom, requestedPixelWidth, requestedPixelHeight }
   };
 }
 
-/**
- * Convert lng/lat to pixel coordinate in the returned image (Web Mercator),
- * with configurable tileSize (Mapbox internals can vary; we auto-pick below).
- */
 function lngLatToPixel({ lng, lat, view, tileSize }) {
   const scale = tileSize * Math.pow(2, view.zoom);
 
   const p = lngLatToWorld(lng, lat);
   const c = lngLatToWorld(view.centerLng, view.centerLat);
 
-  // Longitude wrap handling (keeps dx shortest across the dateline)
   let dxWorld = p.x - c.x;
   if (dxWorld > 0.5) dxWorld -= 1;
   if (dxWorld < -0.5) dxWorld += 1;
@@ -378,30 +371,23 @@ function lngLatToPixel({ lng, lat, view, tileSize }) {
 }
 
 function computeDotPositions({ coords, view, tileSize }) {
-  const positions = [];
-  for (const [lng, lat] of coords) {
+  return coords.map(([lng, lat]) => {
     const { x, y } = lngLatToPixel({ lng, lat, view, tileSize });
-    positions.push({ lng, lat, x, y });
-  }
-  return positions;
+    return { lng, lat, x, y };
+  });
 }
 
 function countInBounds(positions, view) {
   let inBounds = 0;
   for (const p of positions) {
-    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) {
-      inBounds++;
-    }
+    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) inBounds++;
   }
   return inBounds;
 }
 
 /**
- * Draw true minimalist dots (medium + confident):
- * - outer soft halo (white) so it pops on ocean/land
- * - inner filled slate dot
- *
- * IMPORTANT: automatically chooses tileSize (512 vs 256) by whichever places more points in bounds.
+ * Draw true dots onto the PNG.
+ * FIX: uses the PNG’s *actual* pixel dimensions (from sharp metadata).
  */
 async function addDotsToPng({ pngBuffer, coords, view }) {
   const cleaned = cleanCoordinates(coords);
@@ -409,25 +395,34 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
     return { buffer: pngBuffer, debug: { drawn: 0, tileSizeChosen: null } };
   }
 
-  // Try both tile size assumptions; pick the one that puts the most points on-canvas.
-  const pos512 = computeDotPositions({ coords: cleaned, view, tileSize: 512 });
-  const pos256 = computeDotPositions({ coords: cleaned, view, tileSize: 256 });
+  // Get actual image size
+  const meta = await sharp(pngBuffer).metadata();
+  const actualW = meta?.width || view.requestedPixelWidth;
+  const actualH = meta?.height || view.requestedPixelHeight;
 
-  const in512 = countInBounds(pos512, view);
-  const in256 = countInBounds(pos256, view);
+  const actualView = {
+    ...view,
+    pixelWidth: actualW,
+    pixelHeight: actualH
+  };
+
+  // Try both tile sizes and pick whichever places more points on-canvas
+  const pos512 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 512 });
+  const pos256 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 256 });
+
+  const in512 = countInBounds(pos512, actualView);
+  const in256 = countInBounds(pos256, actualView);
 
   const tileSizeChosen = in256 > in512 ? 256 : 512;
   const positions = tileSizeChosen === 256 ? pos256 : pos512;
 
-  // Medium & confident dot sizing (in actual pixels of the returned image)
-  const innerR = 12;     // confident
-  const haloR = 20;      // soft pop
+  // Medium & confident
+  const innerR = 12;
+  const haloR = 20;
 
   const overlays = [];
-
   for (const p of positions) {
-    // Expand bounds slightly so edge points still draw
-    if (p.x < -60 || p.y < -60 || p.x > view.pixelWidth + 60 || p.y > view.pixelHeight + 60) continue;
+    if (p.x < -60 || p.y < -60 || p.x > actualView.pixelWidth + 60 || p.y > actualView.pixelHeight + 60) continue;
 
     const svg = `
       <svg width="${haloR * 2}" height="${haloR * 2}" xmlns="http://www.w3.org/2000/svg">
@@ -451,6 +446,8 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
         tileSizeChosen,
         inBounds512: in512,
         inBounds256: in256,
+        requested: { w: view.requestedPixelWidth, h: view.requestedPixelHeight },
+        actual: { w: actualW, h: actualH },
         sample: positions.slice(0, 3).map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }))
       }
     };
@@ -465,12 +462,14 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
       tileSizeChosen,
       inBounds512: in512,
       inBounds256: in256,
+      requested: { w: view.requestedPixelWidth, h: view.requestedPixelHeight },
+      actual: { w: actualW, h: actualH },
       sample: positions.slice(0, 3).map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }))
     }
   };
 }
 
-/* -------------------- STEP 14: SHOPIFY FILE UPLOAD -------------------- */
+/* -------------------- SHOPIFY HELPERS -------------------- */
 
 function requireShopifyConfig() {
   const shopDomain = process.env.SHOPIFY_SHOP_DOMAIN;
@@ -589,8 +588,6 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
   return { fileId, url, status };
 }
 
-/* -------------------- STEP 15: WRITE TO ORDER (NOTE + METAFIELD) -------------------- */
-
 function orderGidFromNumeric(orderId) {
   if (!orderId) return null;
   return `gid://shopify/Order/${orderId}`;
@@ -650,7 +647,7 @@ async function setOrderMetafieldMapUrl({ orderId, mapUrl }) {
   return data?.metafieldsSet?.metafields?.[0] || null;
 }
 
-/* -------------------- STEP 15: EMAIL CUSTOMER (RESEND) -------------------- */
+/* -------------------- EMAIL (PAUSED UNLESS ENV VARS SET) -------------------- */
 
 async function sendEmailViaResend({ to, subject, html, text }) {
   const apiKey = process.env.RESEND_API_KEY;
@@ -773,19 +770,14 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let cleanedPortQueries = [];
   let resolved = [];
 
-  // URLs for debugging
   let previewBaseUrl = null;
   let finalBaseUrl = null;
-
-  // Dot debug
   let dotsDebug = null;
 
-  // Step 14 outputs (uploaded)
   let shopifyFileId = null;
   let shopifyFileUrl = null;
   let shopifyFileStatus = null;
 
-  // Step 15 outputs
   let orderNoteWritten = false;
   let metafieldWritten = false;
   let emailSent = false;
@@ -809,17 +801,20 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const coords = resolved.map((r) => r.coordinates);
 
-    // Preview base (no dots — just for quick debug)
     const preview = buildBaseMapUrl({ coords, width: 1200, height: 800, retina: false });
     previewBaseUrl = preview.url;
 
-    // Final base (no dots) + view metadata
     const final = buildBaseMapUrl({ coords, width: 1280, height: 853, retina: true });
     finalBaseUrl = final.url;
 
-    // Download final base, then add TRUE dots
     const basePng = await downloadImageToBuffer(final.url);
-    const dotted = await addDotsToPng({ pngBuffer: basePng, coords, view: final.view });
+
+    // Draw dots using actual PNG dimensions
+    const dotted = await addDotsToPng({
+      pngBuffer: basePng,
+      coords,
+      view: final.view
+    });
     dotsDebug = dotted.debug;
 
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
@@ -831,7 +826,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
     shopifyFileUrl = uploaded.url;
     shopifyFileStatus = uploaded.status;
 
-    // Write link to order (note + metafield)
     if (shopifyFileUrl && body.id) {
       await addMapLinkToOrderNote({ orderId: body.id, mapUrl: shopifyFileUrl });
       orderNoteWritten = true;
@@ -840,7 +834,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
       metafieldWritten = true;
     }
 
-    // Email (paused unless you set env vars later)
     const customerEmail = body.email || body?.customer?.email || null;
     if (shopifyFileUrl && customerEmail) {
       const subject = `Your Cruise Route Map (${shipName || "Port to Port"})`;
@@ -919,7 +912,7 @@ If you have any trouble opening it, just reply to this email.
     recentWebhookHits.unshift({
       at: new Date().toISOString(),
       error: String(err?.message || err),
-      map: { previewBaseUrl, finalBaseUrl, dots: dotsDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl },
+      map: { previewBaseUrl, finalBaseUrl, dots: dotsDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl }
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
