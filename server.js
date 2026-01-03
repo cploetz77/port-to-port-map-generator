@@ -21,6 +21,8 @@ app.get("/debug/webhooks", (req, res) => {
   res.send(JSON.stringify(recentWebhookHits, null, 2));
 });
 
+/* -------------------- SHOPIFY LINE ITEM PROPERTY PARSING -------------------- */
+
 function extractLineItemProperties(lineItem) {
   const props = [];
 
@@ -124,6 +126,8 @@ function extractPortsFromStops(obj) {
   return ports;
 }
 
+/* -------------------- PORT NORMALIZATION / GEOCODE -------------------- */
+
 /**
  * Pinned coordinates (pilot)
  * Format: [lng, lat]
@@ -165,8 +169,8 @@ async function geocodePortFallback(portQuery) {
   const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
-  const bbox = "-90,17,-55,32";
-  const proximity = "-75,23.5";
+  const bbox = "-90,17,-55,32";     // Florida + Caribbean-ish
+  const proximity = "-75,23.5";     // Bahamas-ish
 
   const query = encodeURIComponent(portQuery);
   const url =
@@ -226,10 +230,8 @@ function cleanCoordinates(coords) {
   return cleaned;
 }
 
-/**
- * Encoded polyline
- * Input: [[lng,lat], ...]
- */
+/* -------------------- MAPBOX STATIC IMAGE URL BUILD -------------------- */
+
 function encodePolylineLngLat(coords) {
   function encodeSigned(num) {
     let sgnNum = num << 1;
@@ -264,9 +266,6 @@ function encodePolylineLngLat(coords) {
   return result;
 }
 
-/**
- * Compute stable center+zoom (avoid /auto/)
- */
 function lngLatToWorld(lng, lat) {
   const x = (lng + 180) / 360;
   const sin = Math.sin((lat * Math.PI) / 180);
@@ -285,7 +284,7 @@ function computeBounds(coords) {
   return { minLng, maxLng, minLat, maxLat };
 }
 
-function computeCenterZoom(coords, width, height, padding = 120) {
+function computeCenterZoom(coords, width, height, padding = 140) {
   const { minLng, maxLng, minLat, maxLat } = computeBounds(coords);
 
   const centerLng = (minLng + maxLng) / 2;
@@ -312,6 +311,16 @@ function computeCenterZoom(coords, width, height, padding = 120) {
 }
 
 /**
+ * ---- VISUAL THEME (nautical-adjacent but minimal) ----
+ * - Base style: light
+ * - Route: two-layer stroke (soft slate halo + teal)
+ * - Ports: tiny circular dots instead of pins
+ */
+const MAPBOX_STYLE_ID = "mapbox/light-v11";
+const ROUTE_TEAL = "0aa6a6";     // your teal
+const SLATE = "2f3b45";          // your slate
+
+/**
  * Build Static Map URL. If retina=true, appends @2x.
  * NOTE: width/height must be 1..1280 even with @2x.
  */
@@ -325,22 +334,29 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800, retina = false 
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
 
-  const pins = cleaned
-    .map(([lng, lat]) => `pin-s+2f3b45(${lng},${lat})`)
+  // Dot markers (minimal): small circles instead of pins
+  // Using pin-s-circle gives a “designed map print” feel.
+  const dots = cleaned
+    .map(([lng, lat]) => `pin-s-circle+${SLATE}(${lng},${lat})`)
     .join(",");
 
+  // Route polyline
   const poly = encodePolylineLngLat(cleaned);
   const polyEnc = encodeURIComponent(poly);
 
-  const pathOverlay = `path-4+0aa6a6-0.85(${polyEnc})`;
+  // Two-layer route:
+  // 1) halo (wider, low opacity slate) behind
+  // 2) teal route on top
+  const routeHalo = `path-10+${SLATE}-0.18(${polyEnc})`;
+  const routeMain = `path-5+${ROUTE_TEAL}-0.85(${polyEnc})`;
 
-  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 120);
+  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 140);
 
-  const overlay = `${pathOverlay},${pins}`;
-  const style = "mapbox/streets-v12";
+  // Order matters: earlier overlays draw first (behind)
+  const overlay = `${routeHalo},${routeMain},${dots}`;
   const sizePart = retina ? `${width}x${height}@2x` : `${width}x${height}`;
 
-  return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
+  return `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
 }
 
 /* -------------------- STEP 14: SHOPIFY FILE UPLOAD -------------------- */
@@ -390,7 +406,6 @@ async function downloadImageToBuffer(url) {
  * Returns { fileId, url, status }
  */
 async function uploadPngToShopifyFiles({ buffer, filename }) {
-  // 1) Get a staged upload target
   const stagedQuery = `
     mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
       stagedUploadsCreate(input: $input) {
@@ -424,7 +439,7 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
     throw new Error("Invalid staged upload target returned from Shopify.");
   }
 
-  // 2) Upload to the staged target (multipart/form-data)
+  // Node 18+ supports FormData / Blob
   const form = new FormData();
   for (const p of target.parameters) form.append(p.name, p.value);
   form.append("file", new Blob([buffer], { type: "image/png" }), filename);
@@ -435,7 +450,6 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
     throw new Error(`Staged upload failed: ${uploadResp.status} ${t}`);
   }
 
-  // 3) Create the file in Shopify
   const fileCreateQuery = `
     mutation fileCreate($files: [FileCreateInput!]!) {
       fileCreate(files: $files) {
@@ -466,7 +480,7 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
   let url = file?.image?.url || null;
   let status = file?.status || null;
 
-  // 4) Poll for URL if not ready yet
+  // Poll for URL if not ready yet
   if (fileId && !url) {
     const fileQuery = `
       query fileNode($id: ID!) {
@@ -493,9 +507,118 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
   return { fileId, url, status };
 }
 
-/**
- * Run Apify Task and return ports for correct sailing
- */
+/* -------------------- STEP 15: WRITE TO ORDER (NOTE + METAFIELD) -------------------- */
+
+function orderGidFromNumeric(orderId) {
+  if (!orderId) return null;
+  return `gid://shopify/Order/${orderId}`;
+}
+
+async function addMapLinkToOrderNote({ orderId, mapUrl }) {
+  const gid = orderGidFromNumeric(orderId);
+  if (!gid) throw new Error("Missing orderId; cannot update order.");
+
+  const query = `
+    mutation orderUpdate($input: OrderInput!) {
+      orderUpdate(input: $input) {
+        order { id note }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const noteBlock =
+`Port to Port — Map Generated
+Download: ${mapUrl}`;
+
+  const data = await shopifyGraphQL(query, {
+    input: {
+      id: gid,
+      note: noteBlock
+    }
+  });
+
+  const ue = data?.orderUpdate?.userErrors || [];
+  if (ue.length) throw new Error(`orderUpdate userErrors: ${JSON.stringify(ue)}`);
+
+  return data?.orderUpdate?.order?.note || null;
+}
+
+async function setOrderMetafieldMapUrl({ orderId, mapUrl }) {
+  const gid = orderGidFromNumeric(orderId);
+  if (!gid) throw new Error("Missing orderId; cannot set metafield.");
+
+  const query = `
+    mutation metafieldsSet($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields { id namespace key value type }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const vars = {
+    metafields: [
+      {
+        ownerId: gid,
+        namespace: "port_to_port",
+        key: "map_url",
+        type: "single_line_text_field",
+        value: String(mapUrl || "")
+      }
+    ]
+  };
+
+  const data = await shopifyGraphQL(query, vars);
+  const ue = data?.metafieldsSet?.userErrors || [];
+  if (ue.length) throw new Error(`metafieldsSet userErrors: ${JSON.stringify(ue)}`);
+
+  return data?.metafieldsSet?.metafields?.[0] || null;
+}
+
+/* -------------------- STEP 15: EMAIL CUSTOMER (RESEND) -------------------- */
+
+async function sendEmailViaResend({ to, subject, html, text }) {
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM;
+  const bcc = process.env.EMAIL_BCC;
+
+  if (!apiKey || !from) {
+    return { sent: false, skipped: true, reason: "Missing RESEND_API_KEY or EMAIL_FROM" };
+  }
+  if (!to) {
+    return { sent: false, skipped: true, reason: "Missing recipient email" };
+  }
+
+  const payload = {
+    from,
+    to,
+    subject,
+    html,
+    text
+  };
+  if (bcc) payload.bcc = bcc;
+
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const json = await resp.json().catch(() => ({}));
+
+  if (!resp.ok) {
+    return { sent: false, skipped: false, error: `Resend ${resp.status}: ${JSON.stringify(json)}` };
+  }
+
+  return { sent: true, id: json?.id || null };
+}
+
+/* -------------------- APIFY SCRAPE -------------------- */
+
 async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   const token = process.env.APIFY_TOKEN;
   const taskId = process.env.APIFY_TASK_ID;
@@ -571,9 +694,8 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   };
 }
 
-/**
- * Webhook endpoint
- */
+/* -------------------- WEBHOOK -------------------- */
+
 app.post("/webhooks/order-paid", async (req, res) => {
   const body = req.body || {};
   const lineItems = Array.isArray(body.line_items) ? body.line_items : [];
@@ -607,6 +729,12 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let shopifyFileUrl = null;
   let shopifyFileStatus = null;
 
+  // Step 15 outputs
+  let orderNoteWritten = false;
+  let metafieldWritten = false;
+  let emailSent = false;
+  let emailResult = null;
+
   try {
     if (portsChanged && overridePorts.length >= 2) {
       finalPorts = overridePorts;
@@ -632,11 +760,13 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const coords = resolved.map((r) => r.coordinates);
 
-    // Step 13 outputs
+    // Preview (fast)
     previewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800, retina: false });
+
+    // Final deliverable (max + @2x)
     finalImageUrl = buildStaticMapUrl({ coords, width: 1280, height: 853, retina: true });
 
-    // Step 14: download + upload to Shopify Files
+    // Upload deliverable to Shopify Files
     const pngBuffer = await downloadImageToBuffer(finalImageUrl);
 
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
@@ -647,6 +777,51 @@ app.post("/webhooks/order-paid", async (req, res) => {
     shopifyFileId = uploaded.fileId;
     shopifyFileUrl = uploaded.url;
     shopifyFileStatus = uploaded.status;
+
+    // Write link to order (note + metafield)
+    if (shopifyFileUrl && body.id) {
+      await addMapLinkToOrderNote({ orderId: body.id, mapUrl: shopifyFileUrl });
+      orderNoteWritten = true;
+
+      await setOrderMetafieldMapUrl({ orderId: body.id, mapUrl: shopifyFileUrl });
+      metafieldWritten = true;
+    }
+
+    // Email the customer (paused until you set email up; will skip gracefully)
+    const customerEmail = body.email || body?.customer?.email || null;
+
+    if (shopifyFileUrl && customerEmail) {
+      const subject = `Your Cruise Route Map (${shipName || "Port to Port"})`;
+      const text =
+`Hi!
+
+Your Port to Port cruise route map is ready.
+
+Download here:
+${shopifyFileUrl}
+
+If you have any trouble opening it, just reply to this email.
+
+— Port to Port`;
+
+      const html =
+`<div style="font-family: Arial, sans-serif; line-height: 1.5;">
+  <p>Hi!</p>
+  <p>Your <strong>Port to Port</strong> cruise route map is ready.</p>
+  <p><a href="${shopifyFileUrl}">Download your map</a></p>
+  <p style="color:#666;">If you have any trouble opening it, just reply to this email.</p>
+  <p>— Port to Port</p>
+</div>`;
+
+      emailResult = await sendEmailViaResend({ to: customerEmail, subject, html, text });
+      emailSent = Boolean(emailResult?.sent);
+    } else {
+      emailResult = {
+        sent: false,
+        skipped: true,
+        reason: !shopifyFileUrl ? "No shopifyFileUrl" : "No customer email on order payload"
+      };
+    }
 
     const entry = {
       at: new Date().toISOString(),
@@ -683,6 +858,12 @@ app.post("/webhooks/order-paid", async (req, res) => {
         shopifyFileId,
         shopifyFileStatus,
         shopifyFileUrl
+      },
+      delivery: {
+        wroteOrderNote: orderNoteWritten,
+        wroteMetafield: metafieldWritten,
+        emailSent,
+        emailResult
       }
     };
 
@@ -705,11 +886,16 @@ app.post("/webhooks/order-paid", async (req, res) => {
         shopifyFileStatus,
         shopifyFileUrl
       },
+      delivery: {
+        wroteOrderNote: orderNoteWritten,
+        wroteMetafield: metafieldWritten,
+        emailSent,
+        emailResult
+      },
       customization_fields: fields
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
-    // Keep 200 OK to avoid Shopify retry storms while iterating
     res.status(200).send("OK");
   }
 });
