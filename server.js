@@ -316,7 +316,7 @@ const SLATE = "2f3b45";
 
 /**
  * Build base map URL (route only — NO markers).
- * Returns { url, view }
+ * Returns { url, view } where view includes pixelRatio (1 or 2).
  */
 function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false }) {
   const token = process.env.MAPBOX_TOKEN;
@@ -331,6 +331,7 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
   const poly = encodePolylineLngLat(cleaned);
   const polyEnc = encodeURIComponent(poly);
 
+  // Two-layer route (halo + main)
   const routeHalo = `path-10+${SLATE}-0.18(${polyEnc})`;
   const routeMain = `path-5+${ROUTE_TEAL}-0.85(${polyEnc})`;
 
@@ -341,22 +342,31 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
 
   const url = `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
 
-  // IMPORTANT: these are *requested* pixels; actual PNG may differ.
-  const requestedPixelWidth = retina ? width * 2 : width;
-  const requestedPixelHeight = retina ? height * 2 : height;
+  const pixelRatio = retina ? 2 : 1;
 
   return {
     url,
-    view: { centerLng, centerLat, zoom, requestedPixelWidth, requestedPixelHeight }
+    view: {
+      centerLng,
+      centerLat,
+      zoom,
+      pixelRatio,
+      requestedPixelWidth: width * pixelRatio,
+      requestedPixelHeight: height * pixelRatio
+    }
   };
 }
 
+/**
+ * FIXED: multiply mercator scale by pixelRatio for @2x images.
+ */
 function lngLatToPixel({ lng, lat, view, tileSize }) {
-  const scale = tileSize * Math.pow(2, view.zoom);
+  const scale = tileSize * Math.pow(2, view.zoom) * (view.pixelRatio || 1);
 
   const p = lngLatToWorld(lng, lat);
   const c = lngLatToWorld(view.centerLng, view.centerLat);
 
+  // Longitude wrap handling
   let dxWorld = p.x - c.x;
   if (dxWorld > 0.5) dxWorld -= 1;
   if (dxWorld < -0.5) dxWorld += 1;
@@ -371,23 +381,27 @@ function lngLatToPixel({ lng, lat, view, tileSize }) {
 }
 
 function computeDotPositions({ coords, view, tileSize }) {
-  return coords.map(([lng, lat]) => {
+  const positions = [];
+  for (const [lng, lat] of coords) {
     const { x, y } = lngLatToPixel({ lng, lat, view, tileSize });
-    return { lng, lat, x, y };
-  });
+    positions.push({ lng, lat, x, y });
+  }
+  return positions;
 }
 
 function countInBounds(positions, view) {
   let inBounds = 0;
   for (const p of positions) {
-    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) inBounds++;
+    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) {
+      inBounds++;
+    }
   }
   return inBounds;
 }
 
 /**
- * Draw true dots onto the PNG.
- * FIX: uses the PNG’s *actual* pixel dimensions (from sharp metadata).
+ * Draw minimalist dots (halo + core).
+ * Uses actual PNG dimensions but keeps pixelRatio from the URL.
  */
 async function addDotsToPng({ pngBuffer, coords, view }) {
   const cleaned = cleanCoordinates(coords);
@@ -395,7 +409,6 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
     return { buffer: pngBuffer, debug: { drawn: 0, tileSizeChosen: null } };
   }
 
-  // Get actual image size
   const meta = await sharp(pngBuffer).metadata();
   const actualW = meta?.width || view.requestedPixelWidth;
   const actualH = meta?.height || view.requestedPixelHeight;
@@ -406,7 +419,6 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
     pixelHeight: actualH
   };
 
-  // Try both tile sizes and pick whichever places more points on-canvas
   const pos512 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 512 });
   const pos256 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 256 });
 
@@ -416,11 +428,11 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
   const tileSizeChosen = in256 > in512 ? 256 : 512;
   const positions = tileSizeChosen === 256 ? pos256 : pos512;
 
-  // Medium & confident
   const innerR = 12;
   const haloR = 20;
 
   const overlays = [];
+
   for (const p of positions) {
     if (p.x < -60 || p.y < -60 || p.x > actualView.pixelWidth + 60 || p.y > actualView.pixelHeight + 60) continue;
 
@@ -438,22 +450,9 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
     });
   }
 
-  if (!overlays.length) {
-    return {
-      buffer: pngBuffer,
-      debug: {
-        drawn: 0,
-        tileSizeChosen,
-        inBounds512: in512,
-        inBounds256: in256,
-        requested: { w: view.requestedPixelWidth, h: view.requestedPixelHeight },
-        actual: { w: actualW, h: actualH },
-        sample: positions.slice(0, 3).map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }))
-      }
-    };
-  }
-
-  const out = await sharp(pngBuffer).composite(overlays).png().toBuffer();
+  const out = overlays.length
+    ? await sharp(pngBuffer).composite(overlays).png().toBuffer()
+    : pngBuffer;
 
   return {
     buffer: out,
@@ -462,14 +461,14 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
       tileSizeChosen,
       inBounds512: in512,
       inBounds256: in256,
-      requested: { w: view.requestedPixelWidth, h: view.requestedPixelHeight },
+      requested: { w: view.requestedPixelWidth, h: view.requestedPixelHeight, pixelRatio: view.pixelRatio },
       actual: { w: actualW, h: actualH },
       sample: positions.slice(0, 3).map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }))
     }
   };
 }
 
-/* -------------------- SHOPIFY HELPERS -------------------- */
+/* -------------------- STEP 14: SHOPIFY FILE UPLOAD -------------------- */
 
 function requireShopifyConfig() {
   const shopDomain = process.env.SHOPIFY_SHOP_DOMAIN;
@@ -588,6 +587,8 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
   return { fileId, url, status };
 }
 
+/* -------------------- STEP 15: WRITE TO ORDER (NOTE + METAFIELD) -------------------- */
+
 function orderGidFromNumeric(orderId) {
   if (!orderId) return null;
   return `gid://shopify/Order/${orderId}`;
@@ -647,7 +648,7 @@ async function setOrderMetafieldMapUrl({ orderId, mapUrl }) {
   return data?.metafieldsSet?.metafields?.[0] || null;
 }
 
-/* -------------------- EMAIL (PAUSED UNLESS ENV VARS SET) -------------------- */
+/* -------------------- EMAIL CUSTOMER (RESEND) -------------------- */
 
 async function sendEmailViaResend({ to, subject, html, text }) {
   const apiKey = process.env.RESEND_API_KEY;
@@ -772,6 +773,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
   let previewBaseUrl = null;
   let finalBaseUrl = null;
+
   let dotsDebug = null;
 
   let shopifyFileId = null;
@@ -809,7 +811,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const basePng = await downloadImageToBuffer(final.url);
 
-    // Draw dots using actual PNG dimensions
     const dotted = await addDotsToPng({
       pngBuffer: basePng,
       coords,
@@ -845,8 +846,6 @@ Your Port to Port cruise route map is ready.
 Download here:
 ${shopifyFileUrl}
 
-If you have any trouble opening it, just reply to this email.
-
 — Port to Port`;
 
       const html =
@@ -854,7 +853,6 @@ If you have any trouble opening it, just reply to this email.
   <p>Hi!</p>
   <p>Your <strong>Port to Port</strong> cruise route map is ready.</p>
   <p><a href="${shopifyFileUrl}">Download your map</a></p>
-  <p style="color:#666;">If you have any trouble opening it, just reply to this email.</p>
   <p>— Port to Port</p>
 </div>`;
 
@@ -870,16 +868,7 @@ If you have any trouble opening it, just reply to this email.
 
     const entry = {
       at: new Date().toISOString(),
-      topic: req.get("x-shopify-topic") || null,
-      shop: req.get("x-shopify-shop-domain") || null,
-      order: {
-        id: body.id || null,
-        name: body.name || null,
-        email: body.email || null,
-        financial_status: body.financial_status || null
-      },
       inputs: { cruiseLine, shipName, sailDate, portsChanged },
-      customization_fields: fields,
       ports: { source: portsSource, list: finalPorts, chosenMeta },
       map: {
         cleanedPortQueries,
@@ -896,12 +885,7 @@ If you have any trouble opening it, just reply to this email.
         shopifyFileStatus,
         shopifyFileUrl
       },
-      delivery: {
-        wroteOrderNote: orderNoteWritten,
-        wroteMetafield: metafieldWritten,
-        emailSent,
-        emailResult
-      }
+      delivery: { wroteOrderNote: orderNoteWritten, wroteMetafield: metafieldWritten, emailSent, emailResult }
     };
 
     recentWebhookHits.unshift(entry);
