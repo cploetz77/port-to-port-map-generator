@@ -12,24 +12,15 @@ const geocodeCache = new Map();
 // Shopify payloads can be large
 app.use(express.json({ limit: "4mb" }));
 
-/**
- * Health check
- */
 app.get("/", (req, res) => {
   res.send("Savvy Cruiser Map Generator is running");
 });
 
-/**
- * Debug inbox
- */
 app.get("/debug/webhooks", (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.send(JSON.stringify(recentWebhookHits, null, 2));
 });
 
-/**
- * Extract line item properties / custom attributes
- */
 function extractLineItemProperties(lineItem) {
   const props = [];
 
@@ -134,7 +125,7 @@ function extractPortsFromStops(obj) {
 }
 
 /**
- * ✅ Pilot: pinned coordinates for common cruise ports
+ * Pinned coordinates (pilot)
  * Format: [lng, lat]
  */
 const PINNED_PORT_COORDS = {
@@ -167,9 +158,6 @@ function normalizePortText(raw) {
   return s;
 }
 
-/**
- * Mapbox bounded geocode fallback (Florida + Caribbean bbox)
- */
 async function geocodePortFallback(portQuery) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
@@ -239,9 +227,8 @@ function cleanCoordinates(coords) {
 }
 
 /**
- * ✅ Encoded polyline (Google/Mapbox-style)
+ * Encoded polyline
  * Input: [[lng,lat], ...]
- * Output: polyline string (not URL-encoded yet)
  */
 function encodePolylineLngLat(coords) {
   function encodeSigned(num) {
@@ -324,10 +311,6 @@ function computeCenterZoom(coords, width, height, padding = 120) {
   return { centerLng, centerLat, zoom: Number(zoom.toFixed(2)) };
 }
 
-/**
- * ✅ Build Static Map URL with a CORRECT route line:
- * Use path-...(<encoded_polyline>)   <-- no "polyline(...)" wrapper
- */
 function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
@@ -335,22 +318,18 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
 
-  // Pins
   const pins = cleaned
     .map(([lng, lat]) => `pin-s+2f3b45(${lng},${lat})`)
     .join(",");
 
-  // Encoded polyline string -> URL-encode it
   const poly = encodePolylineLngLat(cleaned);
   const polyEnc = encodeURIComponent(poly);
 
-  // IMPORTANT: path overlay takes the polyline directly (no wrapper)
+  // IMPORTANT: path overlay takes encoded polyline directly (no wrapper)
   const pathOverlay = `path-4+0aa6a6-0.85(${polyEnc})`;
 
-  // Center/zoom
   const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 120);
 
-  // Put line first so pins render on top
   const overlay = `${pathOverlay},${pins}`;
   const style = "mapbox/streets-v12";
 
@@ -463,7 +442,8 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
   let cleanedPortQueries = [];
   let resolved = [];
-  let mapPreviewImageUrl = null;
+  let previewImageUrl = null;
+  let finalImageUrl = null;
 
   try {
     if (portsChanged && overridePorts.length >= 2) {
@@ -489,7 +469,12 @@ app.post("/webhooks/order-paid", async (req, res) => {
     }
 
     const coords = resolved.map((r) => r.coordinates);
-    mapPreviewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800 });
+
+    // Preview (fast)
+    previewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800 });
+
+    // Final deliverable (higher-res)
+    finalImageUrl = buildStaticMapUrl({ coords, width: 2400, height: 1600 });
 
     const entry = {
       at: new Date().toISOString(),
@@ -521,7 +506,8 @@ app.post("/webhooks/order-paid", async (req, res) => {
           coordinates: r.coordinates,
           pinned: Boolean(PINNED_PORT_COORDS[r.portQuery])
         })),
-        previewImageUrl: mapPreviewImageUrl
+        previewImageUrl,
+        finalImageUrl
       }
     };
 
@@ -538,7 +524,8 @@ app.post("/webhooks/order-paid", async (req, res) => {
       map: {
         cleanedPortQueries,
         resolvedPorts: resolved,
-        previewImageUrl: mapPreviewImageUrl
+        previewImageUrl,
+        finalImageUrl
       },
       customization_fields: fields
     });
