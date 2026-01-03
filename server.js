@@ -134,10 +134,23 @@ function extractPortsFromStops(obj) {
 }
 
 /**
- * ✅ Strong port normalization:
- * - removes "Arriving in/Departing from"
- * - removes trailing "Arriving in Port ..." duplicates
- * - maps tricky/brand strings to stable geocode queries
+ * ✅ Pilot: canonical port queries (human readable) + pinned coordinates.
+ * This prevents Mapbox from doing insane matches (Germany/India/Ireland).
+ *
+ * Coordinates are approximate (good enough for a pilot preview map).
+ * Format: [lng, lat]
+ */
+const PINNED_PORT_COORDS = {
+  "Port Canaveral, Florida": [-80.6056, 28.4100],
+  "Grand Turk Cruise Center, Turks and Caicos": [-71.1420, 21.4643],
+  "Amber Cove, Dominican Republic": [-70.1500, 19.8330],
+  "Nassau, Bahamas": [-77.3550, 25.0780],
+  "Grand Bahama Island, Bahamas": [-78.6500, 26.5330]
+};
+
+/**
+ * ✅ Turn raw scraped strings into canonical keys we can pin.
+ * If it’s not one we recognize, we return a cleaned string and geocode it within a bbox.
  */
 function normalizePortText(raw) {
   if (!raw) return "";
@@ -148,82 +161,43 @@ function normalizePortText(raw) {
   s = s.replace(/^Arriving at\s+/i, "").trim();
   s = s.replace(/^Departing from\s+/i, "").trim();
 
-  // If it's an "Arriving in <same as departure>" line, normalize to port name
-  s = s.replace(/^Arriving in\s+/i, "").trim();
-
-  // Canonical mappings (this is the big win)
   const lower = s.toLowerCase();
 
-  if (lower.includes("port canaveral")) return "Port Canaveral, FL cruise terminal";
+  if (lower.includes("port canaveral")) return "Port Canaveral, Florida";
   if (lower.includes("grand turk")) return "Grand Turk Cruise Center, Turks and Caicos";
-  if (lower.includes("amber cove") || lower.includes("puerto plata-amber cove")) {
-    return "Amber Cove Cruise Terminal, Dominican Republic";
-  }
-  if (lower.includes("nassau")) return "Nassau Cruise Port, Bahamas";
+  if (lower.includes("amber cove") || lower.includes("puerto plata-amber cove")) return "Amber Cove, Dominican Republic";
+  if (lower.includes("nassau")) return "Nassau, Bahamas";
+  if (lower.includes("celebration key") || lower.includes("grand bahama")) return "Grand Bahama Island, Bahamas";
 
-  // Celebration Key is new and can mis-geocode. Anchor it to Grand Bahama.
-  if (lower.includes("celebration key")) return "Grand Bahama Island, Bahamas";
-
-  // Generic cleanups
+  // generic cleanup
   s = s.replace(/\s+/g, " ").trim();
-
   return s;
 }
 
 /**
- * Mapbox geocode helper: choose a "port/terminal/harbor" style result when possible,
- * with a Caribbean proximity bias to avoid random islands.
+ * Mapbox geocode fallback with a hard bounding box around Florida + Caribbean.
+ * This prevents Europe/India/Ireland results.
  */
-function scoreFeature(feature, query, proximity) {
-  const text = `${feature?.text || ""} ${feature?.place_name || ""}`.toLowerCase();
-  const q = (query || "").toLowerCase();
-
-  let score = 0;
-
-  // Prefer something that literally contains the query words
-  for (const token of q.split(/\s+/).filter(Boolean)) {
-    if (text.includes(token)) score += 2;
-  }
-
-  // Strong preference for port/terminal/harbor
-  if (text.includes("cruise") || text.includes("terminal") || text.includes("port") || text.includes("harbor") || text.includes("harbour")) {
-    score += 10;
-  }
-
-  // Prefer POIs over places if we can detect it
-  if (Array.isArray(feature?.place_type) && feature.place_type.includes("poi")) score += 3;
-
-  // Proximity bonus: closer to the center we set
-  const c = feature?.center;
-  if (Array.isArray(c) && c.length === 2 && proximity) {
-    const dx = (c[0] - proximity[0]);
-    const dy = (c[1] - proximity[1]);
-    const dist2 = dx * dx + dy * dy;
-    // smaller dist2 -> higher score
-    score += Math.max(0, 5 - dist2 * 10);
-  }
-
-  return score;
-}
-
-async function geocodePort(portQuery) {
+async function geocodePortFallback(portQuery) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
 
-  const cacheKey = portQuery.toLowerCase().trim();
+  const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
-  // Caribbean-ish proximity (helps avoid weird far-off matches)
-  // [lng,lat] around the Bahamas
-  const proximity = [-75.0, 23.5];
+  // Bounding box: [minLng,minLat,maxLng,maxLat]
+  // Roughly: Florida + Caribbean
+  const bbox = "-90,17,-55,32";
+  const proximity = "-75,23.5"; // Bahamas-ish
 
   const query = encodeURIComponent(portQuery);
   const url =
     `https://api.mapbox.com/geocoding/v5/mapbox.places/${query}.json` +
     `?access_token=${token}` +
-    `&limit=5` +
+    `&limit=1` +
     `&types=poi,place,locality` +
-    `&proximity=${proximity[0]},${proximity[1]}`;
+    `&bbox=${bbox}` +
+    `&proximity=${proximity}`;
 
   const resp = await fetch(url);
   if (!resp.ok) {
@@ -232,36 +206,37 @@ async function geocodePort(portQuery) {
   }
 
   const data = await resp.json();
-  const features = Array.isArray(data?.features) ? data.features : [];
+  const feature = data?.features?.[0];
+  const center = feature?.center;
 
-  if (!features.length) {
-    throw new Error(`No geocoding result for: ${portQuery}`);
-  }
-
-  // Pick best-scored feature
-  let best = features[0];
-  let bestScore = -Infinity;
-  for (const f of features) {
-    const s = scoreFeature(f, portQuery, proximity);
-    if (s > bestScore) {
-      bestScore = s;
-      best = f;
-    }
-  }
-
-  const center = best?.center;
   if (!Array.isArray(center) || center.length !== 2) {
-    throw new Error(`No usable center coordinate for: ${portQuery}`);
+    throw new Error(`No geocoding result (bbox) for: ${portQuery}`);
   }
 
   const result = {
     portQuery,
-    placeName: best.place_name || portQuery,
+    placeName: feature.place_name || portQuery,
     coordinates: center
   };
 
   geocodeCache.set(cacheKey, result);
   return result;
+}
+
+/**
+ * Main port -> coordinate resolver:
+ * 1) pinned coords if recognized
+ * 2) fallback bounded geocode if not
+ */
+async function resolvePort(portQuery) {
+  if (PINNED_PORT_COORDS[portQuery]) {
+    return {
+      portQuery,
+      placeName: portQuery,
+      coordinates: PINNED_PORT_COORDS[portQuery]
+    };
+  }
+  return geocodePortFallback(portQuery);
 }
 
 function cleanCoordinates(coords) {
@@ -337,7 +312,7 @@ function computeBounds(coords) {
   return { minLng, maxLng, minLat, maxLat };
 }
 
-function computeCenterZoom(coords, width, height, padding = 90) {
+function computeCenterZoom(coords, width, height, padding = 110) {
   const { minLng, maxLng, minLat, maxLat } = computeBounds(coords);
 
   const centerLng = (minLng + maxLng) / 2;
@@ -359,14 +334,12 @@ function computeCenterZoom(coords, width, height, padding = 90) {
   let zoom = Math.min(zoomX, zoomY);
   if (!Number.isFinite(zoom)) zoom = 3;
 
-  // Caribbean cruise maps usually look good in this range
   zoom = Math.max(1, Math.min(zoom, 8));
-
   return { centerLng, centerLat, zoom: Number(zoom.toFixed(2)) };
 }
 
 /**
- * Build Mapbox Static Image URL
+ * Build Mapbox Static Image URL (pins + polyline + explicit center/zoom)
  */
 function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const token = process.env.MAPBOX_TOKEN;
@@ -383,7 +356,7 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const polyEnc = encodeURIComponent(poly);
   const pathOverlay = `path-4+0aa6a6-0.8(polyline(${polyEnc}))`;
 
-  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 100);
+  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 120);
 
   const overlay = `${pins},${pathOverlay}`;
   const style = "mapbox/streets-v12";
@@ -496,7 +469,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let chosenMeta = null;
 
   let cleanedPortQueries = [];
-  let geocoded = [];
+  let resolved = [];
   let mapPreviewImageUrl = null;
 
   try {
@@ -515,28 +488,16 @@ app.post("/webhooks/order-paid", async (req, res) => {
       portsSource = "apify_scrape";
     }
 
-    // IMPORTANT: remove exact duplicate last port label if it’s just “Arriving in <same port>”
-    // (Normalization already helps, but this keeps the route tidy)
-    const normalizedRaw = finalPorts.map((p) => String(p || "").trim());
-    if (normalizedRaw.length >= 2) {
-      const first = normalizedRaw[0].toLowerCase();
-      const last = normalizedRaw[normalizedRaw.length - 1].toLowerCase();
-      if (last.includes("port canaveral") && first.includes("port canaveral")) {
-        // Keep it (round trip) but normalization makes both become same canonical query;
-        // we’ll keep both so the path returns to start.
-      }
-    }
-
-    // Step 12: normalize -> geocode -> map preview
+    // Step 12: normalize -> resolve coords (pinned first) -> map preview
     cleanedPortQueries = finalPorts.map(normalizePortText);
 
-    geocoded = [];
+    resolved = [];
     for (const q of cleanedPortQueries) {
-      const g = await geocodePort(q);
-      geocoded.push(g);
+      const r = await resolvePort(q);
+      resolved.push(r);
     }
 
-    const coords = geocoded.map((g) => g.coordinates);
+    const coords = resolved.map((r) => r.coordinates);
     mapPreviewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800 });
 
     const entry = {
@@ -563,10 +524,11 @@ app.post("/webhooks/order-paid", async (req, res) => {
       },
       map: {
         cleanedPortQueries,
-        geocodedPorts: geocoded.map((g) => ({
-          portQuery: g.portQuery,
-          placeName: g.placeName,
-          coordinates: g.coordinates
+        resolvedPorts: resolved.map((r) => ({
+          portQuery: r.portQuery,
+          placeName: r.placeName,
+          coordinates: r.coordinates,
+          pinned: Boolean(PINNED_PORT_COORDS[r.portQuery])
         })),
         previewImageUrl: mapPreviewImageUrl
       }
@@ -584,14 +546,13 @@ app.post("/webhooks/order-paid", async (req, res) => {
       ports: { source: portsSource, list: finalPorts, chosenMeta },
       map: {
         cleanedPortQueries,
-        geocodedPorts: geocoded,
+        resolvedPorts: resolved,
         previewImageUrl: mapPreviewImageUrl
       },
       customization_fields: fields
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
-    // Pilot choice: avoid Shopify retry storms while iterating
     res.status(200).send("OK");
   }
 });
