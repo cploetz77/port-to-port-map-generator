@@ -134,29 +134,25 @@ function extractPortsFromStops(obj) {
 }
 
 /**
- * ✅ Pilot: canonical port queries (human readable) + pinned coordinates.
- * This prevents Mapbox from doing insane matches (Germany/India/Ireland).
- *
- * Coordinates are approximate (good enough for a pilot preview map).
+ * ✅ Pilot: canonical port queries + pinned coordinates
  * Format: [lng, lat]
  */
 const PINNED_PORT_COORDS = {
-  "Port Canaveral, Florida": [-80.6056, 28.4100],
-  "Grand Turk Cruise Center, Turks and Caicos": [-71.1420, 21.4643],
-  "Amber Cove, Dominican Republic": [-70.1500, 19.8330],
-  "Nassau, Bahamas": [-77.3550, 25.0780],
-  "Grand Bahama Island, Bahamas": [-78.6500, 26.5330]
+  "Port Canaveral, Florida": [-80.6056, 28.41],
+  "Grand Turk Cruise Center, Turks and Caicos": [-71.142, 21.4643],
+  "Amber Cove, Dominican Republic": [-70.15, 19.833],
+  "Nassau, Bahamas": [-77.355, 25.078],
+  "Grand Bahama Island, Bahamas": [-78.65, 26.533]
 };
 
 /**
- * ✅ Turn raw scraped strings into canonical keys we can pin.
- * If it’s not one we recognize, we return a cleaned string and geocode it within a bbox.
+ * Normalize raw scraped strings to canonical pinned keys when possible.
+ * If not recognized, return cleaned string and we’ll bounded-geocode it.
  */
 function normalizePortText(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
 
-  // Strip leading verbs
   s = s.replace(/^Arriving in\s+/i, "").trim();
   s = s.replace(/^Arriving at\s+/i, "").trim();
   s = s.replace(/^Departing from\s+/i, "").trim();
@@ -165,18 +161,18 @@ function normalizePortText(raw) {
 
   if (lower.includes("port canaveral")) return "Port Canaveral, Florida";
   if (lower.includes("grand turk")) return "Grand Turk Cruise Center, Turks and Caicos";
-  if (lower.includes("amber cove") || lower.includes("puerto plata-amber cove")) return "Amber Cove, Dominican Republic";
+  if (lower.includes("amber cove") || lower.includes("puerto plata-amber cove"))
+    return "Amber Cove, Dominican Republic";
   if (lower.includes("nassau")) return "Nassau, Bahamas";
-  if (lower.includes("celebration key") || lower.includes("grand bahama")) return "Grand Bahama Island, Bahamas";
+  if (lower.includes("celebration key") || lower.includes("grand bahama"))
+    return "Grand Bahama Island, Bahamas";
 
-  // generic cleanup
   s = s.replace(/\s+/g, " ").trim();
   return s;
 }
 
 /**
- * Mapbox geocode fallback with a hard bounding box around Florida + Caribbean.
- * This prevents Europe/India/Ireland results.
+ * Mapbox bounded geocode fallback (Florida + Caribbean bbox)
  */
 async function geocodePortFallback(portQuery) {
   const token = process.env.MAPBOX_TOKEN;
@@ -185,9 +181,7 @@ async function geocodePortFallback(portQuery) {
   const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
-  // Bounding box: [minLng,minLat,maxLng,maxLat]
-  // Roughly: Florida + Caribbean
-  const bbox = "-90,17,-55,32";
+  const bbox = "-90,17,-55,32"; // Florida + Caribbean-ish
   const proximity = "-75,23.5"; // Bahamas-ish
 
   const query = encodeURIComponent(portQuery);
@@ -224,9 +218,9 @@ async function geocodePortFallback(portQuery) {
 }
 
 /**
- * Main port -> coordinate resolver:
+ * Port resolver:
  * 1) pinned coords if recognized
- * 2) fallback bounded geocode if not
+ * 2) bounded geocode otherwise
  */
 async function resolvePort(portQuery) {
   if (PINNED_PORT_COORDS[portQuery]) {
@@ -254,44 +248,6 @@ function cleanCoordinates(coords) {
 }
 
 /**
- * Polyline encoding (Mapbox compatible).
- * Input: [[lng,lat],...]
- */
-function encodePolylineLngLat(coords) {
-  function encodeSigned(num) {
-    let sgnNum = num << 1;
-    if (num < 0) sgnNum = ~sgnNum;
-    let encoded = "";
-    while (sgnNum >= 0x20) {
-      encoded += String.fromCharCode((0x20 | (sgnNum & 0x1f)) + 63);
-      sgnNum >>= 5;
-    }
-    encoded += String.fromCharCode(sgnNum + 63);
-    return encoded;
-  }
-
-  let lastLat = 0;
-  let lastLng = 0;
-  let result = "";
-
-  for (const [lng, lat] of coords) {
-    const latE5 = Math.round(lat * 1e5);
-    const lngE5 = Math.round(lng * 1e5);
-
-    const dLat = latE5 - lastLat;
-    const dLng = lngE5 - lastLng;
-
-    lastLat = latE5;
-    lastLng = lngE5;
-
-    result += encodeSigned(dLat);
-    result += encodeSigned(dLng);
-  }
-
-  return result;
-}
-
-/**
  * Compute stable center+zoom (avoid /auto/)
  */
 function lngLatToWorld(lng, lat) {
@@ -312,7 +268,7 @@ function computeBounds(coords) {
   return { minLng, maxLng, minLat, maxLat };
 }
 
-function computeCenterZoom(coords, width, height, padding = 110) {
+function computeCenterZoom(coords, width, height, padding = 120) {
   const { minLng, maxLng, minLat, maxLat } = computeBounds(coords);
 
   const centerLng = (minLng + maxLng) / 2;
@@ -339,7 +295,8 @@ function computeCenterZoom(coords, width, height, padding = 110) {
 }
 
 /**
- * Build Mapbox Static Image URL (pins + polyline + explicit center/zoom)
+ * ✅ Build Mapbox Static Image URL
+ * Uses GeoJSON LineString overlay (reliable) instead of polyline().
  */
 function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const token = process.env.MAPBOX_TOKEN;
@@ -348,17 +305,29 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
 
+  // Pins
   const pins = cleaned
     .map(([lng, lat]) => `pin-s+2f3b45(${lng},${lat})`)
     .join(",");
 
-  const poly = encodePolylineLngLat(cleaned);
-  const polyEnc = encodeURIComponent(poly);
-  const pathOverlay = `path-4+0aa6a6-0.8(polyline(${polyEnc}))`;
+  // GeoJSON line
+  const lineGeojson = {
+    type: "Feature",
+    geometry: {
+      type: "LineString",
+      coordinates: cleaned
+    }
+  };
+  const geo = encodeURIComponent(JSON.stringify(lineGeojson));
 
+  // Route line overlay
+  const pathOverlay = `path-4+0aa6a6-0.85(${geo})`;
+
+  // Explicit center/zoom
   const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 120);
 
-  const overlay = `${pins},${pathOverlay}`;
+  // Put path first so pins sit on top
+  const overlay = `${pathOverlay},${pins}`;
   const style = "mapbox/streets-v12";
 
   return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/${centerLng},${centerLat},${zoom}/${width}x${height}?access_token=${token}`;
@@ -473,7 +442,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let mapPreviewImageUrl = null;
 
   try {
-    // Step 11: choose ports source
+    // Choose ports source
     if (portsChanged && overridePorts.length >= 2) {
       finalPorts = overridePorts;
       portsSource = "customer_override";
@@ -488,7 +457,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
       portsSource = "apify_scrape";
     }
 
-    // Step 12: normalize -> resolve coords (pinned first) -> map preview
+    // Normalize -> resolve coords -> map preview
     cleanedPortQueries = finalPorts.map(normalizePortText);
 
     resolved = [];
