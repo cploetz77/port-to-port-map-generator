@@ -137,15 +137,10 @@ function normalizePortText(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
 
-  // Remove "Arriving in ..."
   s = s.replace(/^Arriving in\s+/i, "").trim();
-  // Remove "Arriving at ..."
   s = s.replace(/^Arriving at\s+/i, "").trim();
-
-  // If someone used full sentence patterns, strip leading verbs
   s = s.replace(/^Departing from\s+/i, "").trim();
 
-  // Optional: remove "Island," etc? (leave as-is for now—Mapbox geocodes fine)
   return s;
 }
 
@@ -183,40 +178,87 @@ async function geocodePort(portName) {
 }
 
 /**
- * Build a Mapbox Static Images URL with route line + dots
- * Uses "auto" to center/zoom.
+ * Validate/clean coordinates
+ */
+function cleanCoordinates(coords) {
+  const cleaned = [];
+  for (const c of coords) {
+    if (!Array.isArray(c) || c.length !== 2) continue;
+    const lng = Number(c[0]);
+    const lat = Number(c[1]);
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) continue;
+    if (lng < -180 || lng > 180) continue;
+    if (lat < -90 || lat > 90) continue;
+    cleaned.push([lng, lat]);
+  }
+  return cleaned;
+}
+
+/**
+ * Polyline encoding (Google/Mapbox compatible).
+ * Input: [[lng,lat],...]
+ * Output: encoded polyline string
+ */
+function encodePolylineLngLat(coords) {
+  // Polyline expects lat,lng order internally
+  function encodeSigned(num) {
+    let sgnNum = num << 1;
+    if (num < 0) sgnNum = ~sgnNum;
+    let encoded = "";
+    while (sgnNum >= 0x20) {
+      encoded += String.fromCharCode((0x20 | (sgnNum & 0x1f)) + 63);
+      sgnNum >>= 5;
+    }
+    encoded += String.fromCharCode(sgnNum + 63);
+    return encoded;
+  }
+
+  let lastLat = 0;
+  let lastLng = 0;
+  let result = "";
+
+  for (const [lng, lat] of coords) {
+    const latE5 = Math.round(lat * 1e5);
+    const lngE5 = Math.round(lng * 1e5);
+
+    const dLat = latE5 - lastLat;
+    const dLng = lngE5 - lastLng;
+
+    lastLat = latE5;
+    lastLng = lngE5;
+
+    result += encodeSigned(dLat);
+    result += encodeSigned(dLng);
+  }
+
+  return result;
+}
+
+/**
+ * Build a Mapbox Static Images URL using encoded polyline (short URL)
  */
 function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
 
-  // GeoJSON line (lng/lat)
-  const lineGeojson = {
-    type: "Feature",
-    geometry: {
-      type: "LineString",
-      coordinates: coords
-    }
-  };
+  const cleaned = cleanCoordinates(coords);
+  if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
 
-  // Encode geojson for the "path" overlay
-  const geo = encodeURIComponent(JSON.stringify(lineGeojson));
-
-  // Teal-ish route line + opacity
-  const pathOverlay = `path-4+0aa6a6-0.8(${geo})`;
-
-  // Add small dot markers for each port
-  // pin-s is small pin; you can change to "marker" style later.
-  const pins = coords
+  // markers (pins)
+  const pins = cleaned
     .map(([lng, lat]) => `pin-s+2f3b45(${lng},${lat})`)
     .join(",");
 
-  const overlay = `${pins},${pathOverlay}`;
+  // encoded polyline route
+  const poly = encodePolylineLngLat(cleaned);
+  const polyEnc = encodeURIComponent(poly);
 
-  // Style can be changed later. This is a solid default:
+  // path overlay (teal-ish line)
+  const pathOverlay = `path-4+0aa6a6-0.8(polyline(${polyEnc}))`;
+
+  const overlay = `${pins},${pathOverlay}`;
   const style = "mapbox/streets-v12";
 
-  // "auto" chooses center/zoom to fit overlays
   return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/auto/${width}x${height}?access_token=${token}`;
 }
 
@@ -231,13 +273,12 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
     throw new Error("Missing APIFY_TOKEN or APIFY_TASK_ID in Render environment variables.");
   }
 
-  // ✅ Input keys based on your Apify input JSON
   const input = {
     cruise_line: cruiseLine || "",
-    end_date: sailDate,              // YYYY-MM-DD
+    end_date: sailDate,
     max_number_of_pages: 1,
     ship_name: shipName,
-    start_date: sailDate,            // YYYY-MM-DD
+    start_date: sailDate,
     cruise_length: "0",
     departure_port: "",
     destination: "0",
@@ -273,7 +314,7 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   const items = await itemsResp.json();
   if (!Array.isArray(items) || items.length === 0) throw new Error("Apify returned no items.");
 
-  const targetCruiseDate = toCruiseDateString(sailDate); // "2025 Dec 06"
+  const targetCruiseDate = toCruiseDateString(sailDate);
   const targetShip = String(shipName || "").trim().toLowerCase();
 
   const candidates = items.filter((it) => {
@@ -325,7 +366,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let portsSource = null;
   let chosenMeta = null;
 
-  // Step 12 additions:
   let mapPreviewImageUrl = null;
   let geocoded = [];
 
@@ -348,17 +388,14 @@ app.post("/webhooks/order-paid", async (req, res) => {
     // Step 12: geocode ports -> coordinates
     const cleanedPorts = finalPorts.map(normalizePortText);
 
-    // Geocode in sequence (simple & reliable for pilot)
-    // Later we can parallelize + cache.
     geocoded = [];
     for (const p of cleanedPorts) {
       const g = await geocodePort(p);
       geocoded.push(g);
     }
 
-    const coords = geocoded.map((g) => g.coordinates); // [[lng,lat],...]
+    const coords = geocoded.map((g) => g.coordinates);
 
-    // Build a Static Image URL with route line + pins
     mapPreviewImageUrl = buildStaticMapUrl({
       coords,
       width: 1200,
@@ -419,7 +456,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
-    // Pilot choice: return 200 to avoid retry storms while iterating
     res.status(200).send("OK");
   }
 });
