@@ -296,6 +296,8 @@ function computeCenterZoom(coords, width, height, padding = 140) {
   const usableW = Math.max(1, width - padding * 2);
   const usableH = Math.max(1, height - padding * 2);
 
+  // This is only used to pick zoom. Mapbox rendering details can differ slightly,
+  // which is why we’ll “auto-pick” the best tile size later for dot placement.
   const tileSize = 512;
   const zoomX = Math.log2(usableW / (worldWidth * tileSize));
   const zoomY = Math.log2(usableH / (worldHeight * tileSize));
@@ -342,7 +344,6 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
 
   const url = `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
 
-  // Actual pixel dimensions of the PNG returned
   const pixelWidth = retina ? width * 2 : width;
   const pixelHeight = retina ? height * 2 : height;
 
@@ -353,47 +354,80 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
 }
 
 /**
- * Convert lng/lat to pixel coordinate in the returned image (Web Mercator).
- * Uses the same zoom and center used to request the static image.
+ * Convert lng/lat to pixel coordinate in the returned image (Web Mercator),
+ * with configurable tileSize (Mapbox internals can vary; we auto-pick below).
  */
-function lngLatToPixel({ lng, lat, view }) {
-  const tileSize = 512;
+function lngLatToPixel({ lng, lat, view, tileSize }) {
   const scale = tileSize * Math.pow(2, view.zoom);
 
   const p = lngLatToWorld(lng, lat);
   const c = lngLatToWorld(view.centerLng, view.centerLat);
 
-  const dx = (p.x - c.x) * scale;
+  // Longitude wrap handling (keeps dx shortest across the dateline)
+  let dxWorld = p.x - c.x;
+  if (dxWorld > 0.5) dxWorld -= 1;
+  if (dxWorld < -0.5) dxWorld += 1;
+
+  const dx = dxWorld * scale;
   const dy = (p.y - c.y) * scale;
 
-  // Center of image is 0,0
   const x = view.pixelWidth / 2 + dx;
   const y = view.pixelHeight / 2 + dy;
 
   return { x, y };
 }
 
+function computeDotPositions({ coords, view, tileSize }) {
+  const positions = [];
+  for (const [lng, lat] of coords) {
+    const { x, y } = lngLatToPixel({ lng, lat, view, tileSize });
+    positions.push({ lng, lat, x, y });
+  }
+  return positions;
+}
+
+function countInBounds(positions, view) {
+  let inBounds = 0;
+  for (const p of positions) {
+    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) {
+      inBounds++;
+    }
+  }
+  return inBounds;
+}
+
 /**
  * Draw true minimalist dots (medium + confident):
  * - outer soft halo (white) so it pops on ocean/land
  * - inner filled slate dot
+ *
+ * IMPORTANT: automatically chooses tileSize (512 vs 256) by whichever places more points in bounds.
  */
 async function addDotsToPng({ pngBuffer, coords, view }) {
   const cleaned = cleanCoordinates(coords);
-  if (cleaned.length < 1) return pngBuffer;
+  if (cleaned.length < 1) {
+    return { buffer: pngBuffer, debug: { drawn: 0, tileSizeChosen: null } };
+  }
 
-  // Dot sizing tuned for "medium & confident"
-  // (retina images are already 2x pixels, so sizes here are in actual pixels)
-  const innerR = Math.round(Math.max(8, Math.min(16, view.pixelWidth / 300))); // ~9–12 on typical sizes
-  const haloR = innerR + 6;
+  // Try both tile size assumptions; pick the one that puts the most points on-canvas.
+  const pos512 = computeDotPositions({ coords: cleaned, view, tileSize: 512 });
+  const pos256 = computeDotPositions({ coords: cleaned, view, tileSize: 256 });
+
+  const in512 = countInBounds(pos512, view);
+  const in256 = countInBounds(pos256, view);
+
+  const tileSizeChosen = in256 > in512 ? 256 : 512;
+  const positions = tileSizeChosen === 256 ? pos256 : pos512;
+
+  // Medium & confident dot sizing (in actual pixels of the returned image)
+  const innerR = 12;     // confident
+  const haloR = 20;      // soft pop
 
   const overlays = [];
 
-  for (const [lng, lat] of cleaned) {
-    const { x, y } = lngLatToPixel({ lng, lat, view });
-
-    // Skip if off-image
-    if (x < -50 || y < -50 || x > view.pixelWidth + 50 || y > view.pixelHeight + 50) continue;
+  for (const p of positions) {
+    // Expand bounds slightly so edge points still draw
+    if (p.x < -60 || p.y < -60 || p.x > view.pixelWidth + 60 || p.y > view.pixelHeight + 60) continue;
 
     const svg = `
       <svg width="${haloR * 2}" height="${haloR * 2}" xmlns="http://www.w3.org/2000/svg">
@@ -404,17 +438,36 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
 
     overlays.push({
       input: Buffer.from(svg),
-      left: Math.round(x - haloR),
-      top: Math.round(y - haloR)
+      left: Math.round(p.x - haloR),
+      top: Math.round(p.y - haloR)
     });
   }
 
-  if (!overlays.length) return pngBuffer;
+  if (!overlays.length) {
+    return {
+      buffer: pngBuffer,
+      debug: {
+        drawn: 0,
+        tileSizeChosen,
+        inBounds512: in512,
+        inBounds256: in256,
+        sample: positions.slice(0, 3).map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }))
+      }
+    };
+  }
 
-  return await sharp(pngBuffer)
-    .composite(overlays)
-    .png()
-    .toBuffer();
+  const out = await sharp(pngBuffer).composite(overlays).png().toBuffer();
+
+  return {
+    buffer: out,
+    debug: {
+      drawn: overlays.length,
+      tileSizeChosen,
+      inBounds512: in512,
+      inBounds256: in256,
+      sample: positions.slice(0, 3).map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }))
+    }
+  };
 }
 
 /* -------------------- STEP 14: SHOPIFY FILE UPLOAD -------------------- */
@@ -724,6 +777,9 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let previewBaseUrl = null;
   let finalBaseUrl = null;
 
+  // Dot debug
+  let dotsDebug = null;
+
   // Step 14 outputs (uploaded)
   let shopifyFileId = null;
   let shopifyFileUrl = null;
@@ -761,15 +817,16 @@ app.post("/webhooks/order-paid", async (req, res) => {
     const final = buildBaseMapUrl({ coords, width: 1280, height: 853, retina: true });
     finalBaseUrl = final.url;
 
-    // Download final base, then add TRUE dots, then upload to Shopify
+    // Download final base, then add TRUE dots
     const basePng = await downloadImageToBuffer(final.url);
-    const dottedPng = await addDotsToPng({ pngBuffer: basePng, coords, view: final.view });
+    const dotted = await addDotsToPng({ pngBuffer: basePng, coords, view: final.view });
+    dotsDebug = dotted.debug;
 
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
     const safeDate = (sailDate || "date").replace(/[^0-9-]+/g, "");
     const filename = `cruise-map-${safeShip}-${safeDate}.png`;
 
-    const uploaded = await uploadPngToShopifyFiles({ buffer: dottedPng, filename });
+    const uploaded = await uploadPngToShopifyFiles({ buffer: dotted.buffer, filename });
     shopifyFileId = uploaded.fileId;
     shopifyFileUrl = uploaded.url;
     shopifyFileStatus = uploaded.status;
@@ -841,6 +898,7 @@ If you have any trouble opening it, just reply to this email.
         })),
         previewBaseUrl,
         finalBaseUrl,
+        dots: dotsDebug,
         shopifyFileId,
         shopifyFileStatus,
         shopifyFileUrl
@@ -861,7 +919,7 @@ If you have any trouble opening it, just reply to this email.
     recentWebhookHits.unshift({
       at: new Date().toISOString(),
       error: String(err?.message || err),
-      map: { previewBaseUrl, finalBaseUrl, shopifyFileId, shopifyFileStatus, shopifyFileUrl },
+      map: { previewBaseUrl, finalBaseUrl, dots: dotsDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl },
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
