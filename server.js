@@ -131,15 +131,48 @@ function extractPortsFromStops(obj) {
 }
 
 /**
- * Clean up port strings so geocoding works better
+ * ✅ Improved port normalization so Mapbox geocodes correctly.
+ * Fixes:
+ * - Port Canaveral string mapping to Orlando
+ * - Celebration Key mapping to Anguilla
  */
 function normalizePortText(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
 
+  // Strip leading verbs
   s = s.replace(/^Arriving in\s+/i, "").trim();
   s = s.replace(/^Arriving at\s+/i, "").trim();
   s = s.replace(/^Departing from\s+/i, "").trim();
+
+  // Force clean geocode targets for known tricky phrases
+  if (/port canaveral/i.test(s)) {
+    return "Port Canaveral, Florida";
+  }
+
+  if (/amber cove/i.test(s)) {
+    return "Amber Cove, Dominican Republic";
+  }
+
+  if (/celebration key/i.test(s)) {
+    return "Grand Bahama Island, Bahamas";
+  }
+
+  // Bahamas bias: if it mentions Bahamas, ensure Bahamas is included
+  if (/bahamas/i.test(s) && !/,\s*bahamas/i.test(s.toLowerCase())) {
+    s = `${s}, Bahamas`;
+  }
+
+  // Reduce extra descriptors that cause "wrong city" matches.
+  // If there are lots of comma-separated parts, prefer "Town/Port + Country"
+  const parts = s.split(",").map((p) => p.trim()).filter(Boolean);
+  if (parts.length >= 3) {
+    const last = parts[parts.length - 1];
+    const townLike = parts.find((p) => /town|city|port/i.test(p));
+    if (townLike && last) {
+      return `${townLike}, ${last}`;
+    }
+  }
 
   return s;
 }
@@ -177,9 +210,6 @@ async function geocodePort(portName) {
   };
 }
 
-/**
- * Validate/clean coordinates
- */
 function cleanCoordinates(coords) {
   const cleaned = [];
   for (const c of coords) {
@@ -195,12 +225,10 @@ function cleanCoordinates(coords) {
 }
 
 /**
- * Polyline encoding (Google/Mapbox compatible).
+ * Polyline encoding (Mapbox compatible).
  * Input: [[lng,lat],...]
- * Output: encoded polyline string
  */
 function encodePolylineLngLat(coords) {
-  // Polyline expects lat,lng order internally
   function encodeSigned(num) {
     let sgnNum = num << 1;
     if (num < 0) sgnNum = ~sgnNum;
@@ -244,16 +272,14 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
 
-  // markers (pins)
+  // Pins for each stop
   const pins = cleaned
     .map(([lng, lat]) => `pin-s+2f3b45(${lng},${lat})`)
     .join(",");
 
-  // encoded polyline route
+  // Encoded polyline route line
   const poly = encodePolylineLngLat(cleaned);
   const polyEnc = encodeURIComponent(poly);
-
-  // path overlay (teal-ish line)
   const pathOverlay = `path-4+0aa6a6-0.8(polyline(${polyEnc}))`;
 
   const overlay = `${pins},${pathOverlay}`;
@@ -366,8 +392,9 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let portsSource = null;
   let chosenMeta = null;
 
-  let mapPreviewImageUrl = null;
+  let cleanedPortQueries = [];
   let geocoded = [];
+  let mapPreviewImageUrl = null;
 
   try {
     // Step 11: choose ports source
@@ -385,22 +412,17 @@ app.post("/webhooks/order-paid", async (req, res) => {
       portsSource = "apify_scrape";
     }
 
-    // Step 12: geocode ports -> coordinates
-    const cleanedPorts = finalPorts.map(normalizePortText);
+    // Step 12: normalize ports -> geocode -> map preview
+    cleanedPortQueries = finalPorts.map(normalizePortText);
 
     geocoded = [];
-    for (const p of cleanedPorts) {
+    for (const p of cleanedPortQueries) {
       const g = await geocodePort(p);
       geocoded.push(g);
     }
 
     const coords = geocoded.map((g) => g.coordinates);
-
-    mapPreviewImageUrl = buildStaticMapUrl({
-      coords,
-      width: 1200,
-      height: 800
-    });
+    mapPreviewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800 });
 
     const entry = {
       at: new Date().toISOString(),
@@ -425,6 +447,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
         chosenMeta
       },
       map: {
+        cleanedPortQueries,
         geocodedPorts: geocoded.map((g) => ({
           portName: g.portName,
           placeName: g.placeName,
@@ -449,6 +472,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
       inputs: { cruiseLine, shipName, sailDate, portsChanged },
       ports: { source: portsSource, list: finalPorts, chosenMeta },
       map: {
+        cleanedPortQueries,
         geocodedPorts: geocoded,
         previewImageUrl: mapPreviewImageUrl
       },
