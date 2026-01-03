@@ -312,8 +312,8 @@ function computeCenterZoom(coords, width, height, padding = 120) {
 }
 
 /**
- * Build Static Map URL.
- * If retina=true, appends @2x (must keep width/height within 1..1280).
+ * Build Static Map URL. If retina=true, appends @2x.
+ * NOTE: width/height must be 1..1280 even with @2x.
  */
 function buildStaticMapUrl({ coords, width = 1200, height = 800, retina = false }) {
   const token = process.env.MAPBOX_TOKEN;
@@ -341,6 +341,156 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800, retina = false 
   const sizePart = retina ? `${width}x${height}@2x` : `${width}x${height}`;
 
   return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
+}
+
+/* -------------------- STEP 14: SHOPIFY FILE UPLOAD -------------------- */
+
+function requireShopifyConfig() {
+  const shopDomain = process.env.SHOPIFY_SHOP_DOMAIN;
+  const adminToken = process.env.SHOPIFY_ADMIN_TOKEN;
+  if (!shopDomain) throw new Error("Missing SHOPIFY_SHOP_DOMAIN in Render environment variables.");
+  if (!adminToken) throw new Error("Missing SHOPIFY_ADMIN_TOKEN in Render environment variables.");
+  return { shopDomain, adminToken };
+}
+
+async function shopifyGraphQL(query, variables) {
+  const { shopDomain, adminToken } = requireShopifyConfig();
+
+  const resp = await fetch(`https://${shopDomain}/admin/api/2025-01/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": adminToken
+    },
+    body: JSON.stringify({ query, variables })
+  });
+
+  const json = await resp.json();
+  if (!resp.ok) {
+    throw new Error(`Shopify GraphQL HTTP ${resp.status}: ${JSON.stringify(json)}`);
+  }
+  if (json.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+  return json.data;
+}
+
+async function downloadImageToBuffer(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(`Failed to download image: ${resp.status} ${t}`);
+  }
+  const arr = await resp.arrayBuffer();
+  return Buffer.from(arr);
+}
+
+/**
+ * Upload an image buffer to Shopify Files using stagedUploadsCreate + fileCreate.
+ * Returns { fileId, url, status }
+ */
+async function uploadPngToShopifyFiles({ buffer, filename }) {
+  // 1) Get a staged upload target
+  const stagedQuery = `
+    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
+      stagedUploadsCreate(input: $input) {
+        stagedTargets {
+          url
+          resourceUrl
+          parameters { name value }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const stagedInput = [
+    {
+      resource: "FILE",
+      filename,
+      mimeType: "image/png",
+      httpMethod: "POST"
+    }
+  ];
+
+  const stagedData = await shopifyGraphQL(stagedQuery, { input: stagedInput });
+  const staged = stagedData?.stagedUploadsCreate;
+  if (staged?.userErrors?.length) {
+    throw new Error(`stagedUploadsCreate userErrors: ${JSON.stringify(staged.userErrors)}`);
+  }
+
+  const target = staged?.stagedTargets?.[0];
+  if (!target?.url || !target?.resourceUrl || !Array.isArray(target.parameters)) {
+    throw new Error("Invalid staged upload target returned from Shopify.");
+  }
+
+  // 2) Upload to the staged target (multipart/form-data)
+  const form = new FormData();
+  for (const p of target.parameters) form.append(p.name, p.value);
+  form.append("file", new Blob([buffer], { type: "image/png" }), filename);
+
+  const uploadResp = await fetch(target.url, { method: "POST", body: form });
+  if (!uploadResp.ok) {
+    const t = await uploadResp.text();
+    throw new Error(`Staged upload failed: ${uploadResp.status} ${t}`);
+  }
+
+  // 3) Create the file in Shopify
+  const fileCreateQuery = `
+    mutation fileCreate($files: [FileCreateInput!]!) {
+      fileCreate(files: $files) {
+        files { ... on MediaImage { id status image { url } } }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const fileCreateVars = {
+    files: [
+      {
+        contentType: "IMAGE",
+        originalSource: target.resourceUrl,
+        alt: "Cruise route map"
+      }
+    ]
+  };
+
+  const fileCreateData = await shopifyGraphQL(fileCreateQuery, fileCreateVars);
+  const fc = fileCreateData?.fileCreate;
+  if (fc?.userErrors?.length) {
+    throw new Error(`fileCreate userErrors: ${JSON.stringify(fc.userErrors)}`);
+  }
+
+  const file = fc?.files?.[0];
+  const fileId = file?.id || null;
+  let url = file?.image?.url || null;
+  let status = file?.status || null;
+
+  // 4) Poll for URL if not ready yet
+  if (fileId && !url) {
+    const fileQuery = `
+      query fileNode($id: ID!) {
+        node(id: $id) {
+          ... on MediaImage {
+            id
+            status
+            image { url }
+          }
+        }
+      }
+    `;
+
+    for (let i = 0; i < 8; i++) {
+      await new Promise((r) => setTimeout(r, 800));
+      const data = await shopifyGraphQL(fileQuery, { id: fileId });
+      const node = data?.node;
+      status = node?.status || status;
+      url = node?.image?.url || url;
+      if (url) break;
+    }
+  }
+
+  return { fileId, url, status };
 }
 
 /**
@@ -452,6 +602,11 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let previewImageUrl = null;
   let finalImageUrl = null;
 
+  // Step 14 outputs
+  let shopifyFileId = null;
+  let shopifyFileUrl = null;
+  let shopifyFileStatus = null;
+
   try {
     if (portsChanged && overridePorts.length >= 2) {
       finalPorts = overridePorts;
@@ -477,11 +632,21 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const coords = resolved.map((r) => r.coordinates);
 
-    // Preview (fast)
+    // Step 13 outputs
     previewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800, retina: false });
-
-    // Final deliverable (max size + @2x = 2560px wide output)
     finalImageUrl = buildStaticMapUrl({ coords, width: 1280, height: 853, retina: true });
+
+    // Step 14: download + upload to Shopify Files
+    const pngBuffer = await downloadImageToBuffer(finalImageUrl);
+
+    const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
+    const safeDate = (sailDate || "date").replace(/[^0-9-]+/g, "");
+    const filename = `cruise-map-${safeShip}-${safeDate}.png`;
+
+    const uploaded = await uploadPngToShopifyFiles({ buffer: pngBuffer, filename });
+    shopifyFileId = uploaded.fileId;
+    shopifyFileUrl = uploaded.url;
+    shopifyFileStatus = uploaded.status;
 
     const entry = {
       at: new Date().toISOString(),
@@ -514,7 +679,10 @@ app.post("/webhooks/order-paid", async (req, res) => {
           pinned: Boolean(PINNED_PORT_COORDS[r.portQuery])
         })),
         previewImageUrl,
-        finalImageUrl
+        finalImageUrl,
+        shopifyFileId,
+        shopifyFileStatus,
+        shopifyFileUrl
       }
     };
 
@@ -532,12 +700,16 @@ app.post("/webhooks/order-paid", async (req, res) => {
         cleanedPortQueries,
         resolvedPorts: resolved,
         previewImageUrl,
-        finalImageUrl
+        finalImageUrl,
+        shopifyFileId,
+        shopifyFileStatus,
+        shopifyFileUrl
       },
       customization_fields: fields
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
+    // Keep 200 OK to avoid Shopify retry storms while iterating
     res.status(200).send("OK");
   }
 });
