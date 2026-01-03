@@ -311,9 +311,16 @@ function computeCenterZoom(coords, width, height, padding = 120) {
   return { centerLng, centerLat, zoom: Number(zoom.toFixed(2)) };
 }
 
-function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
+/**
+ * Build Static Map URL.
+ * If retina=true, appends @2x (must keep width/height within 1..1280).
+ */
+function buildStaticMapUrl({ coords, width = 1200, height = 800, retina = false }) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
+
+  if (width < 1 || width > 1280) throw new Error("Width must be between 1-1280.");
+  if (height < 1 || height > 1280) throw new Error("Height must be between 1-1280.");
 
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
@@ -325,15 +332,15 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const poly = encodePolylineLngLat(cleaned);
   const polyEnc = encodeURIComponent(poly);
 
-  // IMPORTANT: path overlay takes encoded polyline directly (no wrapper)
   const pathOverlay = `path-4+0aa6a6-0.85(${polyEnc})`;
 
   const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 120);
 
   const overlay = `${pathOverlay},${pins}`;
   const style = "mapbox/streets-v12";
+  const sizePart = retina ? `${width}x${height}@2x` : `${width}x${height}`;
 
-  return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/${centerLng},${centerLat},${zoom}/${width}x${height}?access_token=${token}`;
+  return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
 }
 
 /**
@@ -471,10 +478,10 @@ app.post("/webhooks/order-paid", async (req, res) => {
     const coords = resolved.map((r) => r.coordinates);
 
     // Preview (fast)
-    previewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800 });
+    previewImageUrl = buildStaticMapUrl({ coords, width: 1200, height: 800, retina: false });
 
-    // Final deliverable (higher-res)
-    finalImageUrl = buildStaticMapUrl({ coords, width: 2400, height: 1600 });
+    // Final deliverable (max size + @2x = 2560px wide output)
+    finalImageUrl = buildStaticMapUrl({ coords, width: 1280, height: 853, retina: true });
 
     const entry = {
       at: new Date().toISOString(),
