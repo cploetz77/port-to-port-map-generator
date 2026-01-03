@@ -17,7 +17,7 @@ app.get("/", (req, res) => {
 });
 
 /**
- * Debug inbox: open in browser to see last webhook events & selected ports
+ * Debug inbox: open in browser to see last webhook events & selected ports + map preview URL
  */
 app.get("/debug/webhooks", (req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -30,7 +30,6 @@ app.get("/debug/webhooks", (req, res) => {
 function extractLineItemProperties(lineItem) {
   const props = [];
 
-  // Common Shopify format: lineItem.properties = [{ name, value }, ...]
   if (Array.isArray(lineItem?.properties)) {
     for (const p of lineItem.properties) {
       const name = p?.name ?? p?.key;
@@ -41,7 +40,6 @@ function extractLineItemProperties(lineItem) {
     }
   }
 
-  // Some sources store as customAttributes = [{ key, value }, ...]
   if (Array.isArray(lineItem?.customAttributes)) {
     for (const p of lineItem.customAttributes) {
       const name = p?.key ?? p?.name;
@@ -55,9 +53,6 @@ function extractLineItemProperties(lineItem) {
   return props;
 }
 
-/**
- * Helper: get a field value by substring match on the field name
- */
 function getField(fields, labelContains) {
   const hit = fields.find((f) =>
     (f.name || "").toLowerCase().includes(labelContains.toLowerCase())
@@ -65,11 +60,8 @@ function getField(fields, labelContains) {
   return hit ? hit.value : null;
 }
 
-/**
- * Collect "Actual Port 1", "Actual Port 2", ... in numeric order
- */
 function getActualPorts(fields) {
-  const ports = fields
+  return fields
     .filter((f) => (f.name || "").toLowerCase().includes("actual port"))
     .map((f) => {
       const m = String(f.name).match(/(\d+)/);
@@ -79,23 +71,13 @@ function getActualPorts(fields) {
     .filter((x) => x.value.length > 0)
     .sort((a, b) => a.n - b.n)
     .map((x) => x.value);
-
-  return ports;
 }
 
-/**
- * Normalize date to YYYY-MM-DD if user entered MM/DD/YYYY
- * - "12/06/2025" -> "2025-12-06"
- * Leaves other formats untouched.
- */
 function normalizeDateToYyyyMmDd(value) {
   if (!value) return value;
   const s = String(value).trim();
-
-  // Already YYYY-MM-DD
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
 
-  // MM/DD/YYYY
   const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (m) {
     const mm = String(parseInt(m[1], 10)).padStart(2, "0");
@@ -103,14 +85,9 @@ function normalizeDateToYyyyMmDd(value) {
     const yyyy = m[3];
     return `${yyyy}-${mm}-${dd}`;
   }
-
   return s;
 }
 
-/**
- * Convert YYYY-MM-DD -> "YYYY Mon DD" to match Apify output cruise_date
- * Example: 2025-12-06 -> "2025 Dec 06"
- */
 function toCruiseDateString(yyyyMmDd) {
   if (!yyyyMmDd || typeof yyyyMmDd !== "string") return "";
   const parts = yyyyMmDd.split("-");
@@ -126,9 +103,6 @@ function toCruiseDateString(yyyyMmDd) {
   return `${y} ${mon} ${dd}`;
 }
 
-/**
- * Extract ports from Apify output "stop_#_text" fields.
- */
 function extractPortsFromStops(obj) {
   const keys = Object.keys(obj).filter(
     (k) => k.startsWith("stop_") && k.endsWith("_text")
@@ -157,10 +131,97 @@ function extractPortsFromStops(obj) {
 }
 
 /**
+ * Clean up port strings so geocoding works better
+ */
+function normalizePortText(raw) {
+  if (!raw) return "";
+  let s = String(raw).trim();
+
+  // Remove "Arriving in ..."
+  s = s.replace(/^Arriving in\s+/i, "").trim();
+  // Remove "Arriving at ..."
+  s = s.replace(/^Arriving at\s+/i, "").trim();
+
+  // If someone used full sentence patterns, strip leading verbs
+  s = s.replace(/^Departing from\s+/i, "").trim();
+
+  // Optional: remove "Island," etc? (leave as-is for now—Mapbox geocodes fine)
+  return s;
+}
+
+/**
+ * Mapbox geocode a place name to [lng, lat]
+ */
+async function geocodePort(portName) {
+  const token = process.env.MAPBOX_TOKEN;
+  if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
+
+  const query = encodeURIComponent(portName);
+  const url =
+    `https://api.mapbox.com/geocoding/v5/mapbox.places/${query}.json` +
+    `?access_token=${token}&limit=1&types=place,locality,poi`;
+
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(`Mapbox geocoding failed: ${resp.status} ${t}`);
+  }
+
+  const data = await resp.json();
+  const feature = data?.features?.[0];
+  const center = feature?.center;
+
+  if (!Array.isArray(center) || center.length !== 2) {
+    throw new Error(`No geocoding result for: ${portName}`);
+  }
+
+  return {
+    portName,
+    placeName: feature.place_name || portName,
+    coordinates: center // [lng, lat]
+  };
+}
+
+/**
+ * Build a Mapbox Static Images URL with route line + dots
+ * Uses "auto" to center/zoom.
+ */
+function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
+  const token = process.env.MAPBOX_TOKEN;
+  if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
+
+  // GeoJSON line (lng/lat)
+  const lineGeojson = {
+    type: "Feature",
+    geometry: {
+      type: "LineString",
+      coordinates: coords
+    }
+  };
+
+  // Encode geojson for the "path" overlay
+  const geo = encodeURIComponent(JSON.stringify(lineGeojson));
+
+  // Teal-ish route line + opacity
+  const pathOverlay = `path-4+0aa6a6-0.8(${geo})`;
+
+  // Add small dot markers for each port
+  // pin-s is small pin; you can change to "marker" style later.
+  const pins = coords
+    .map(([lng, lat]) => `pin-s+2f3b45(${lng},${lat})`)
+    .join(",");
+
+  const overlay = `${pins},${pathOverlay}`;
+
+  // Style can be changed later. This is a solid default:
+  const style = "mapbox/streets-v12";
+
+  // "auto" chooses center/zoom to fit overlays
+  return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/auto/${width}x${height}?access_token=${token}`;
+}
+
+/**
  * Run Apify Task and return a ports list for the correct sailing.
- * Expects env vars:
- * - APIFY_TOKEN
- * - APIFY_TASK_ID
  */
 async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   const token = process.env.APIFY_TOKEN;
@@ -184,7 +245,6 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
     port_of_call: ""
   };
 
-  // Run task and wait for finish
   const runUrl = `https://api.apify.com/v2/actor-tasks/${taskId}/runs?token=${token}&waitForFinish=120`;
 
   const runResp = await fetch(runUrl, {
@@ -200,12 +260,8 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
 
   const runData = await runResp.json();
   const datasetId = runData?.data?.defaultDatasetId;
+  if (!datasetId) throw new Error("Apify run did not return defaultDatasetId.");
 
-  if (!datasetId) {
-    throw new Error("Apify run did not return defaultDatasetId.");
-  }
-
-  // Fetch dataset items (array)
   const itemsUrl = `https://api.apify.com/v2/datasets/${datasetId}/items?token=${token}&clean=true&format=json`;
   const itemsResp = await fetch(itemsUrl);
 
@@ -215,12 +271,8 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   }
 
   const items = await itemsResp.json();
+  if (!Array.isArray(items) || items.length === 0) throw new Error("Apify returned no items.");
 
-  if (!Array.isArray(items) || items.length === 0) {
-    throw new Error("Apify returned no items.");
-  }
-
-  // Filter to exact ship + exact sail date
   const targetCruiseDate = toCruiseDateString(sailDate); // "2025 Dec 06"
   const targetShip = String(shipName || "").trim().toLowerCase();
 
@@ -230,14 +282,11 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
     return ship === targetShip && cd === targetCruiseDate;
   });
 
-  const chosen = candidates[0] || items[0]; // fallback for pilot stability
-
+  const chosen = candidates[0] || items[0];
   const ports = extractPortsFromStops(chosen);
 
   if (!ports.length) {
-    throw new Error(
-      `Could not extract ports. Chosen keys: ${Object.keys(chosen).join(", ")}`
-    );
+    throw new Error(`Could not extract ports. Keys: ${Object.keys(chosen).join(", ")}`);
   }
 
   return {
@@ -251,7 +300,7 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
 }
 
 /**
- * Webhook endpoint: Shopify will POST here
+ * Webhook endpoint: Shopify POSTs here
  */
 app.post("/webhooks/order-paid", async (req, res) => {
   const body = req.body || {};
@@ -259,17 +308,12 @@ app.post("/webhooks/order-paid", async (req, res) => {
   const firstItem = lineItems[0] || {};
   const fields = extractLineItemProperties(firstItem);
 
-  // Pull common fields (these must match your input field labels loosely)
   const cruiseLine = getField(fields, "cruise line");
-
-  // ✅ Small improvement: match both "ship" and "ships"
   const shipName = getField(fields, "ship") || getField(fields, "ships");
 
-  // ✅ Fix 2: normalize Sail Date to YYYY-MM-DD
   let sailDate = getField(fields, "sail date");
   sailDate = normalizeDateToYyyyMmDd(sailDate);
 
-  // Determine override vs scrape
   const portsChanged =
     !!getField(fields, "ports of call changed") ||
     !!getField(fields, "ports changed") ||
@@ -281,7 +325,12 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let portsSource = null;
   let chosenMeta = null;
 
+  // Step 12 additions:
+  let mapPreviewImageUrl = null;
+  let geocoded = [];
+
   try {
+    // Step 11: choose ports source
     if (portsChanged && overridePorts.length >= 2) {
       finalPorts = overridePorts;
       portsSource = "customer_override";
@@ -295,6 +344,26 @@ app.post("/webhooks/order-paid", async (req, res) => {
       chosenMeta = apifyResult.chosenMeta;
       portsSource = "apify_scrape";
     }
+
+    // Step 12: geocode ports -> coordinates
+    const cleanedPorts = finalPorts.map(normalizePortText);
+
+    // Geocode in sequence (simple & reliable for pilot)
+    // Later we can parallelize + cache.
+    geocoded = [];
+    for (const p of cleanedPorts) {
+      const g = await geocodePort(p);
+      geocoded.push(g);
+    }
+
+    const coords = geocoded.map((g) => g.coordinates); // [[lng,lat],...]
+
+    // Build a Static Image URL with route line + pins
+    mapPreviewImageUrl = buildStaticMapUrl({
+      coords,
+      width: 1200,
+      height: 800
+    });
 
     const entry = {
       at: new Date().toISOString(),
@@ -317,13 +386,21 @@ app.post("/webhooks/order-paid", async (req, res) => {
         source: portsSource,
         list: finalPorts,
         chosenMeta
+      },
+      map: {
+        geocodedPorts: geocoded.map((g) => ({
+          portName: g.portName,
+          placeName: g.placeName,
+          coordinates: g.coordinates
+        })),
+        previewImageUrl: mapPreviewImageUrl
       }
     };
 
     recentWebhookHits.unshift(entry);
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
-    console.log("✅ Ports selected:", portsSource, finalPorts);
+    console.log("✅ Preview map URL:", mapPreviewImageUrl);
 
     res.status(200).send("OK");
   } catch (err) {
@@ -333,11 +410,16 @@ app.post("/webhooks/order-paid", async (req, res) => {
       at: new Date().toISOString(),
       error: String(err?.message || err),
       inputs: { cruiseLine, shipName, sailDate, portsChanged },
+      ports: { source: portsSource, list: finalPorts, chosenMeta },
+      map: {
+        geocodedPorts: geocoded,
+        previewImageUrl: mapPreviewImageUrl
+      },
       customization_fields: fields
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
-    // Pilot choice: avoid Shopify retry storms while iterating
+    // Pilot choice: return 200 to avoid retry storms while iterating
     res.status(200).send("OK");
   }
 });
