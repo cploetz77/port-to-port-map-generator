@@ -20,7 +20,7 @@ app.get("/", (req, res) => {
 });
 
 /**
- * Debug inbox: open in browser to see last webhook events & selected ports + map preview URL
+ * Debug inbox
  */
 app.get("/debug/webhooks", (req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -134,7 +134,7 @@ function extractPortsFromStops(obj) {
 }
 
 /**
- * ✅ Pilot: canonical port queries + pinned coordinates
+ * ✅ Pilot: pinned coordinates for common cruise ports
  * Format: [lng, lat]
  */
 const PINNED_PORT_COORDS = {
@@ -145,10 +145,6 @@ const PINNED_PORT_COORDS = {
   "Grand Bahama Island, Bahamas": [-78.65, 26.533]
 };
 
-/**
- * Normalize raw scraped strings to canonical pinned keys when possible.
- * If not recognized, return cleaned string and we’ll bounded-geocode it.
- */
 function normalizePortText(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
@@ -181,8 +177,8 @@ async function geocodePortFallback(portQuery) {
   const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
-  const bbox = "-90,17,-55,32"; // Florida + Caribbean-ish
-  const proximity = "-75,23.5"; // Bahamas-ish
+  const bbox = "-90,17,-55,32";
+  const proximity = "-75,23.5";
 
   const query = encodeURIComponent(portQuery);
   const url =
@@ -217,11 +213,6 @@ async function geocodePortFallback(portQuery) {
   return result;
 }
 
-/**
- * Port resolver:
- * 1) pinned coords if recognized
- * 2) bounded geocode otherwise
- */
 async function resolvePort(portQuery) {
   if (PINNED_PORT_COORDS[portQuery]) {
     return {
@@ -245,6 +236,45 @@ function cleanCoordinates(coords) {
     cleaned.push([lng, lat]);
   }
   return cleaned;
+}
+
+/**
+ * ✅ Encoded polyline (Google/Mapbox-style)
+ * Input: [[lng,lat], ...]
+ * Output: polyline string (not URL-encoded yet)
+ */
+function encodePolylineLngLat(coords) {
+  function encodeSigned(num) {
+    let sgnNum = num << 1;
+    if (num < 0) sgnNum = ~sgnNum;
+    let encoded = "";
+    while (sgnNum >= 0x20) {
+      encoded += String.fromCharCode((0x20 | (sgnNum & 0x1f)) + 63);
+      sgnNum >>= 5;
+    }
+    encoded += String.fromCharCode(sgnNum + 63);
+    return encoded;
+  }
+
+  let lastLat = 0;
+  let lastLng = 0;
+  let result = "";
+
+  for (const [lng, lat] of coords) {
+    const latE5 = Math.round(lat * 1e5);
+    const lngE5 = Math.round(lng * 1e5);
+
+    const dLat = latE5 - lastLat;
+    const dLng = lngE5 - lastLng;
+
+    lastLat = latE5;
+    lastLng = lngE5;
+
+    result += encodeSigned(dLat);
+    result += encodeSigned(dLng);
+  }
+
+  return result;
 }
 
 /**
@@ -295,8 +325,8 @@ function computeCenterZoom(coords, width, height, padding = 120) {
 }
 
 /**
- * ✅ Build Mapbox Static Image URL
- * Uses GeoJSON LineString overlay (reliable) instead of polyline().
+ * ✅ Build Static Map URL with a CORRECT route line:
+ * Use path-...(<encoded_polyline>)   <-- no "polyline(...)" wrapper
  */
 function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const token = process.env.MAPBOX_TOKEN;
@@ -310,23 +340,17 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
     .map(([lng, lat]) => `pin-s+2f3b45(${lng},${lat})`)
     .join(",");
 
-  // GeoJSON line
-  const lineGeojson = {
-    type: "Feature",
-    geometry: {
-      type: "LineString",
-      coordinates: cleaned
-    }
-  };
-  const geo = encodeURIComponent(JSON.stringify(lineGeojson));
+  // Encoded polyline string -> URL-encode it
+  const poly = encodePolylineLngLat(cleaned);
+  const polyEnc = encodeURIComponent(poly);
 
-  // Route line overlay
-  const pathOverlay = `path-4+0aa6a6-0.85(${geo})`;
+  // IMPORTANT: path overlay takes the polyline directly (no wrapper)
+  const pathOverlay = `path-4+0aa6a6-0.85(${polyEnc})`;
 
-  // Explicit center/zoom
+  // Center/zoom
   const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 120);
 
-  // Put path first so pins sit on top
+  // Put line first so pins render on top
   const overlay = `${pathOverlay},${pins}`;
   const style = "mapbox/streets-v12";
 
@@ -442,7 +466,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let mapPreviewImageUrl = null;
 
   try {
-    // Choose ports source
     if (portsChanged && overridePorts.length >= 2) {
       finalPorts = overridePorts;
       portsSource = "customer_override";
@@ -457,7 +480,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
       portsSource = "apify_scrape";
     }
 
-    // Normalize -> resolve coords -> map preview
     cleanedPortQueries = finalPorts.map(normalizePortText);
 
     resolved = [];
