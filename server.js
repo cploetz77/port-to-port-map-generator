@@ -314,10 +314,6 @@ const MAPBOX_STYLE_ID = "mapbox/light-v11";
 const ROUTE_TEAL = "0aa6a6";
 const SLATE = "2f3b45";
 
-/**
- * Build base map URL (route only — NO markers).
- * Returns { url, view } where view includes pixelRatio (1 or 2).
- */
 function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false }) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
@@ -331,7 +327,6 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
   const poly = encodePolylineLngLat(cleaned);
   const polyEnc = encodeURIComponent(poly);
 
-  // Two-layer route (halo + main)
   const routeHalo = `path-10+${SLATE}-0.18(${polyEnc})`;
   const routeMain = `path-5+${ROUTE_TEAL}-0.85(${polyEnc})`;
 
@@ -357,16 +352,14 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
   };
 }
 
-/**
- * FIXED: multiply mercator scale by pixelRatio for @2x images.
- */
+/* -------------------- DOT + LABEL DRAWING -------------------- */
+
 function lngLatToPixel({ lng, lat, view, tileSize }) {
   const scale = tileSize * Math.pow(2, view.zoom) * (view.pixelRatio || 1);
 
   const p = lngLatToWorld(lng, lat);
   const c = lngLatToWorld(view.centerLng, view.centerLat);
 
-  // Longitude wrap handling
   let dxWorld = p.x - c.x;
   if (dxWorld > 0.5) dxWorld -= 1;
   if (dxWorld < -0.5) dxWorld += 1;
@@ -381,32 +374,78 @@ function lngLatToPixel({ lng, lat, view, tileSize }) {
 }
 
 function computeDotPositions({ coords, view, tileSize }) {
-  const positions = [];
-  for (const [lng, lat] of coords) {
+  return coords.map(([lng, lat]) => {
     const { x, y } = lngLatToPixel({ lng, lat, view, tileSize });
-    positions.push({ lng, lat, x, y });
-  }
-  return positions;
+    return { lng, lat, x, y };
+  });
 }
 
 function countInBounds(positions, view) {
   let inBounds = 0;
   for (const p of positions) {
-    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) {
-      inBounds++;
-    }
+    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) inBounds++;
   }
   return inBounds;
 }
 
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+// Minimal “pretty” label text
+function shortPortLabel(portQuery) {
+  if (!portQuery) return "";
+  let s = String(portQuery);
+
+  // remove common cruise-y fluff
+  s = s.replace(/Cruise Center/gi, "").replace(/Cruise Terminal/gi, "").replace(/\s+/g, " ").trim();
+
+  // keep first chunk before comma, unless that would be too vague
+  const parts = s.split(",").map((p) => p.trim()).filter(Boolean);
+  const first = parts[0] || s;
+
+  // If first chunk is super short, add the next chunk
+  if (first.length < 5 && parts.length > 1) return `${first}, ${parts[1]}`;
+  return first;
+}
+
+// Smart label placement to avoid clipping
+function chooseLabelPlacement({ x, y, view, labelW, labelH }) {
+  // default: up-right
+  const pad = 14;
+  const dx = 24;
+  const dy = -28;
+
+  let left = Math.round(x + dx);
+  let top = Math.round(y + dy - labelH);
+
+  // if off right edge, flip to left
+  if (left + labelW + pad > view.pixelWidth) {
+    left = Math.round(x - dx - labelW);
+  }
+  // if off top edge, put below
+  if (top < pad) {
+    top = Math.round(y + 24);
+  }
+  // clamp inside
+  left = Math.max(pad, Math.min(left, view.pixelWidth - labelW - pad));
+  top = Math.max(pad, Math.min(top, view.pixelHeight - labelH - pad));
+
+  return { left, top };
+}
+
 /**
- * Draw minimalist dots (halo + core).
- * Uses actual PNG dimensions but keeps pixelRatio from the URL.
+ * Adds dots + labels in one composite pass (better layering control).
  */
-async function addDotsToPng({ pngBuffer, coords, view }) {
+async function addDotsAndLabelsToPng({ pngBuffer, coords, labels, view }) {
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 1) {
-    return { buffer: pngBuffer, debug: { drawn: 0, tileSizeChosen: null } };
+    return { buffer: pngBuffer, debug: { drawnDots: 0, drawnLabels: 0 } };
   }
 
   const meta = await sharp(pngBuffer).metadata();
@@ -419,6 +458,7 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
     pixelHeight: actualH
   };
 
+  // pick tileSize
   const pos512 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 512 });
   const pos256 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 256 });
 
@@ -428,10 +468,61 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
   const tileSizeChosen = in256 > in512 ? 256 : 512;
   const positions = tileSizeChosen === 256 ? pos256 : pos512;
 
+  // Medium & confident dots
   const innerR = 12;
   const haloR = 20;
 
+  // Label styling (scaled for @2x)
+  const fontSize = 30; // good at 2560 wide
+  const padX = 18;
+  const padY = 12;
+  const radius = 16;
+
   const overlays = [];
+
+  // 1) labels first (so dots sit on top visually)
+  let drawnLabels = 0;
+
+  for (let i = 0; i < positions.length; i++) {
+    const p = positions[i];
+    const rawLabel = labels?.[i] ?? "";
+    if (!rawLabel) continue;
+
+    const text = escapeXml(rawLabel);
+
+    // crude width estimate: fontSize * 0.62 * chars + padding
+    const labelW = Math.min(
+      Math.max(220, Math.round(text.length * fontSize * 0.62 + padX * 2)),
+      820
+    );
+    const labelH = Math.round(fontSize + padY * 2);
+
+    // Special placement for last label if it returns to start (avoid overlap)
+    let leftTop = chooseLabelPlacement({ x: p.x, y: p.y, view: actualView, labelW, labelH });
+
+    overlays.push({
+      input: Buffer.from(
+        `
+        <svg width="${labelW}" height="${labelH}" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0" y="0" width="${labelW}" height="${labelH}" rx="${radius}" ry="${radius}"
+            fill="white" fill-opacity="0.86"/>
+          <text x="${padX}" y="${Math.round(labelH / 2 + fontSize * 0.35)}"
+            font-family="Arial, Helvetica, sans-serif"
+            font-size="${fontSize}"
+            fill="#${SLATE}"
+            fill-opacity="1">${text}</text>
+        </svg>
+        `.trim()
+      ),
+      left: leftTop.left,
+      top: leftTop.top
+    });
+
+    drawnLabels++;
+  }
+
+  // 2) dots on top
+  let drawnDots = 0;
 
   for (const p of positions) {
     if (p.x < -60 || p.y < -60 || p.x > actualView.pixelWidth + 60 || p.y > actualView.pixelHeight + 60) continue;
@@ -448,16 +539,17 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
       left: Math.round(p.x - haloR),
       top: Math.round(p.y - haloR)
     });
+
+    drawnDots++;
   }
 
-  const out = overlays.length
-    ? await sharp(pngBuffer).composite(overlays).png().toBuffer()
-    : pngBuffer;
+  const out = overlays.length ? await sharp(pngBuffer).composite(overlays).png().toBuffer() : pngBuffer;
 
   return {
     buffer: out,
     debug: {
-      drawn: overlays.length,
+      drawnDots,
+      drawnLabels,
       tileSizeChosen,
       inBounds512: in512,
       inBounds256: in256,
@@ -468,7 +560,7 @@ async function addDotsToPng({ pngBuffer, coords, view }) {
   };
 }
 
-/* -------------------- STEP 14: SHOPIFY FILE UPLOAD -------------------- */
+/* -------------------- SHOPIFY HELPERS -------------------- */
 
 function requireShopifyConfig() {
   const shopDomain = process.env.SHOPIFY_SHOP_DOMAIN;
@@ -587,8 +679,6 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
   return { fileId, url, status };
 }
 
-/* -------------------- STEP 15: WRITE TO ORDER (NOTE + METAFIELD) -------------------- */
-
 function orderGidFromNumeric(orderId) {
   if (!orderId) return null;
   return `gid://shopify/Order/${orderId}`;
@@ -648,7 +738,7 @@ async function setOrderMetafieldMapUrl({ orderId, mapUrl }) {
   return data?.metafieldsSet?.metafields?.[0] || null;
 }
 
-/* -------------------- EMAIL CUSTOMER (RESEND) -------------------- */
+/* -------------------- EMAIL (RESEND) -------------------- */
 
 async function sendEmailViaResend({ to, subject, html, text }) {
   const apiKey = process.env.RESEND_API_KEY;
@@ -774,7 +864,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let previewBaseUrl = null;
   let finalBaseUrl = null;
 
-  let dotsDebug = null;
+  let mapDebug = null;
 
   let shopifyFileId = null;
   let shopifyFileUrl = null;
@@ -803,6 +893,25 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const coords = resolved.map((r) => r.coordinates);
 
+    // Labels aligned to coords list
+    const shortNames = cleanedPortQueries.map(shortPortLabel);
+
+    // Start/end handling (avoid two identical labels on same dot)
+    const labels = shortNames.map((n) => n);
+    if (labels.length >= 2) {
+      const first = labels[0];
+      const last = labels[labels.length - 1];
+      const sameStartEnd = first === last;
+
+      if (sameStartEnd) {
+        labels[0] = `Depart/Return: ${first}`;
+        labels[labels.length - 1] = ""; // avoid overlap
+      } else {
+        labels[0] = `Depart: ${first}`;
+        labels[labels.length - 1] = `Arrive: ${last}`;
+      }
+    }
+
     const preview = buildBaseMapUrl({ coords, width: 1200, height: 800, retina: false });
     previewBaseUrl = preview.url;
 
@@ -811,18 +920,19 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const basePng = await downloadImageToBuffer(final.url);
 
-    const dotted = await addDotsToPng({
+    const rendered = await addDotsAndLabelsToPng({
       pngBuffer: basePng,
       coords,
+      labels,
       view: final.view
     });
-    dotsDebug = dotted.debug;
+    mapDebug = rendered.debug;
 
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
     const safeDate = (sailDate || "date").replace(/[^0-9-]+/g, "");
     const filename = `cruise-map-${safeShip}-${safeDate}.png`;
 
-    const uploaded = await uploadPngToShopifyFiles({ buffer: dotted.buffer, filename });
+    const uploaded = await uploadPngToShopifyFiles({ buffer: rendered.buffer, filename });
     shopifyFileId = uploaded.fileId;
     shopifyFileUrl = uploaded.url;
     shopifyFileStatus = uploaded.status;
@@ -880,7 +990,7 @@ ${shopifyFileUrl}
         })),
         previewBaseUrl,
         finalBaseUrl,
-        dots: dotsDebug,
+        render: mapDebug,
         shopifyFileId,
         shopifyFileStatus,
         shopifyFileUrl
@@ -896,7 +1006,7 @@ ${shopifyFileUrl}
     recentWebhookHits.unshift({
       at: new Date().toISOString(),
       error: String(err?.message || err),
-      map: { previewBaseUrl, finalBaseUrl, dots: dotsDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl }
+      map: { previewBaseUrl, finalBaseUrl, render: mapDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl }
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
