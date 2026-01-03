@@ -132,9 +132,6 @@ function extractPortsFromStops(obj) {
 
 /**
  * ✅ Improved port normalization so Mapbox geocodes correctly.
- * Fixes:
- * - Port Canaveral string mapping to Orlando
- * - Celebration Key mapping to Anguilla
  */
 function normalizePortText(raw) {
   if (!raw) return "";
@@ -158,13 +155,12 @@ function normalizePortText(raw) {
     return "Grand Bahama Island, Bahamas";
   }
 
-  // Bahamas bias: if it mentions Bahamas, ensure Bahamas is included
+  // Bahamas bias
   if (/bahamas/i.test(s) && !/,\s*bahamas/i.test(s.toLowerCase())) {
     s = `${s}, Bahamas`;
   }
 
   // Reduce extra descriptors that cause "wrong city" matches.
-  // If there are lots of comma-separated parts, prefer "Town/Port + Country"
   const parts = s.split(",").map((p) => p.trim()).filter(Boolean);
   if (parts.length >= 3) {
     const last = parts[parts.length - 1];
@@ -263,7 +259,56 @@ function encodePolylineLngLat(coords) {
 }
 
 /**
- * Build a Mapbox Static Images URL using encoded polyline (short URL)
+ * Helpers to compute stable center+zoom (avoid Mapbox /auto/ brittleness)
+ */
+function lngLatToWorld(lng, lat) {
+  const x = (lng + 180) / 360;
+  const sin = Math.sin((lat * Math.PI) / 180);
+  const y = 0.5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI);
+  return { x, y };
+}
+
+function computeBounds(coords) {
+  let minLng = 180, maxLng = -180, minLat = 90, maxLat = -90;
+  for (const [lng, lat] of coords) {
+    minLng = Math.min(minLng, lng);
+    maxLng = Math.max(maxLng, lng);
+    minLat = Math.min(minLat, lat);
+    maxLat = Math.max(maxLat, lat);
+  }
+  return { minLng, maxLng, minLat, maxLat };
+}
+
+function computeCenterZoom(coords, width, height, padding = 70) {
+  const { minLng, maxLng, minLat, maxLat } = computeBounds(coords);
+
+  const centerLng = (minLng + maxLng) / 2;
+  const centerLat = (minLat + maxLat) / 2;
+
+  const a = lngLatToWorld(minLng, maxLat);
+  const b = lngLatToWorld(maxLng, minLat);
+
+  const worldWidth = Math.abs(b.x - a.x) || 1e-9;
+  const worldHeight = Math.abs(b.y - a.y) || 1e-9;
+
+  const usableW = Math.max(1, width - padding * 2);
+  const usableH = Math.max(1, height - padding * 2);
+
+  const tileSize = 512;
+  const zoomX = Math.log2(usableW / (worldWidth * tileSize));
+  const zoomY = Math.log2(usableH / (worldHeight * tileSize));
+
+  let zoom = Math.min(zoomX, zoomY);
+  if (!Number.isFinite(zoom)) zoom = 3;
+
+  // Clamp: cruises usually look good between 2 and 9
+  zoom = Math.max(1, Math.min(zoom, 10));
+
+  return { centerLng, centerLat, zoom: Number(zoom.toFixed(2)) };
+}
+
+/**
+ * Build a Mapbox Static Images URL using encoded polyline and explicit center+zoom
  */
 function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const token = process.env.MAPBOX_TOKEN;
@@ -282,14 +327,20 @@ function buildStaticMapUrl({ coords, width = 1200, height = 800 }) {
   const polyEnc = encodeURIComponent(poly);
   const pathOverlay = `path-4+0aa6a6-0.8(polyline(${polyEnc}))`;
 
+  // Compute center+zoom instead of /auto/
+  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 80);
+
   const overlay = `${pins},${pathOverlay}`;
   const style = "mapbox/streets-v12";
 
-  return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/auto/${width}x${height}?access_token=${token}`;
+  return `https://api.mapbox.com/styles/v1/${style}/static/${overlay}/${centerLng},${centerLat},${zoom}/${width}x${height}?access_token=${token}`;
 }
 
 /**
  * Run Apify Task and return a ports list for the correct sailing.
+ * Requires:
+ * - APIFY_TOKEN
+ * - APIFY_TASK_ID
  */
 async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   const token = process.env.APIFY_TOKEN;
@@ -412,7 +463,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
       portsSource = "apify_scrape";
     }
 
-    // Step 12: normalize ports -> geocode -> map preview
+    // Step 12: normalize -> geocode -> map preview
     cleanedPortQueries = finalPorts.map(normalizePortText);
 
     geocoded = [];
@@ -480,6 +531,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
+    // Pilot choice: avoid Shopify retry storms while iterating
     res.status(200).send("OK");
   }
 });
