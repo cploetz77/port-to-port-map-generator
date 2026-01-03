@@ -166,6 +166,7 @@ async function geocodePortFallback(portQuery) {
   const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
+  // Caribbean-ish bbox to reduce “Frankfurt airport” style mistakes
   const bbox = "-90,17,-55,32";
   const proximity = "-75,23.5";
 
@@ -352,7 +353,7 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
   };
 }
 
-/* -------------------- DOT + LABEL DRAWING -------------------- */
+/* -------------------- DOTS + MINIMAL TAGS -------------------- */
 
 function lngLatToPixel({ lng, lat, view, tileSize }) {
   const scale = tileSize * Math.pow(2, view.zoom) * (view.pixelRatio || 1);
@@ -373,7 +374,7 @@ function lngLatToPixel({ lng, lat, view, tileSize }) {
   return { x, y };
 }
 
-function computeDotPositions({ coords, view, tileSize }) {
+function computePositions({ coords, view, tileSize }) {
   return coords.map(([lng, lat]) => {
     const { x, y } = lngLatToPixel({ lng, lat, view, tileSize });
     return { lng, lat, x, y };
@@ -381,11 +382,11 @@ function computeDotPositions({ coords, view, tileSize }) {
 }
 
 function countInBounds(positions, view) {
-  let inBounds = 0;
+  let n = 0;
   for (const p of positions) {
-    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) inBounds++;
+    if (p.x >= 0 && p.y >= 0 && p.x <= view.pixelWidth && p.y <= view.pixelHeight) n++;
   }
-  return inBounds;
+  return n;
 }
 
 function escapeXml(s) {
@@ -397,55 +398,44 @@ function escapeXml(s) {
     .replace(/'/g, "&apos;");
 }
 
-// Minimal “pretty” label text
-function shortPortLabel(portQuery) {
-  if (!portQuery) return "";
-  let s = String(portQuery);
+function placeTinyTag({ x, y, view, tagW, tagH, prefer = "ur" }) {
+  // prefer: "ur" up-right, "ul", "dr", "dl"
+  const pad = 10;
+  const gap = 14;
 
-  // remove common cruise-y fluff
-  s = s.replace(/Cruise Center/gi, "").replace(/Cruise Terminal/gi, "").replace(/\s+/g, " ").trim();
+  const candidates = [];
+  const ur = { left: Math.round(x + gap), top: Math.round(y - gap - tagH) };
+  const ul = { left: Math.round(x - gap - tagW), top: Math.round(y - gap - tagH) };
+  const dr = { left: Math.round(x + gap), top: Math.round(y + gap) };
+  const dl = { left: Math.round(x - gap - tagW), top: Math.round(y + gap) };
 
-  // keep first chunk before comma, unless that would be too vague
-  const parts = s.split(",").map((p) => p.trim()).filter(Boolean);
-  const first = parts[0] || s;
+  const order = prefer === "ur"
+    ? [ur, ul, dr, dl]
+    : prefer === "ul"
+      ? [ul, ur, dl, dr]
+      : prefer === "dr"
+        ? [dr, dl, ur, ul]
+        : [dl, dr, ul, ur];
 
-  // If first chunk is super short, add the next chunk
-  if (first.length < 5 && parts.length > 1) return `${first}, ${parts[1]}`;
-  return first;
-}
-
-// Smart label placement to avoid clipping
-function chooseLabelPlacement({ x, y, view, labelW, labelH }) {
-  // default: up-right
-  const pad = 14;
-  const dx = 24;
-  const dy = -28;
-
-  let left = Math.round(x + dx);
-  let top = Math.round(y + dy - labelH);
-
-  // if off right edge, flip to left
-  if (left + labelW + pad > view.pixelWidth) {
-    left = Math.round(x - dx - labelW);
+  for (const c of order) {
+    candidates.push({
+      left: Math.max(pad, Math.min(c.left, view.pixelWidth - tagW - pad)),
+      top: Math.max(pad, Math.min(c.top, view.pixelHeight - tagH - pad))
+    });
   }
-  // if off top edge, put below
-  if (top < pad) {
-    top = Math.round(y + 24);
-  }
-  // clamp inside
-  left = Math.max(pad, Math.min(left, view.pixelWidth - labelW - pad));
-  top = Math.max(pad, Math.min(top, view.pixelHeight - labelH - pad));
 
-  return { left, top };
+  return candidates[0];
 }
 
 /**
- * Adds dots + labels in one composite pass (better layering control).
+ * Renders:
+ * - numbered dots (1..N) inside the dot
+ * - tiny START / END tags only (no port names yet)
  */
-async function addDotsAndLabelsToPng({ pngBuffer, coords, labels, view }) {
+async function addNumberedDotsAndTagsToPng({ pngBuffer, coords, view }) {
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 1) {
-    return { buffer: pngBuffer, debug: { drawnDots: 0, drawnLabels: 0 } };
+    return { buffer: pngBuffer, debug: { drawnDots: 0, drawnTags: 0 } };
   }
 
   const meta = await sharp(pngBuffer).metadata();
@@ -458,9 +448,8 @@ async function addDotsAndLabelsToPng({ pngBuffer, coords, labels, view }) {
     pixelHeight: actualH
   };
 
-  // pick tileSize
-  const pos512 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 512 });
-  const pos256 = computeDotPositions({ coords: cleaned, view: actualView, tileSize: 256 });
+  const pos512 = computePositions({ coords: cleaned, view: actualView, tileSize: 512 });
+  const pos256 = computePositions({ coords: cleaned, view: actualView, tileSize: 256 });
 
   const in512 = countInBounds(pos512, actualView);
   const in256 = countInBounds(pos256, actualView);
@@ -468,69 +457,120 @@ async function addDotsAndLabelsToPng({ pngBuffer, coords, labels, view }) {
   const tileSizeChosen = in256 > in512 ? 256 : 512;
   const positions = tileSizeChosen === 256 ? pos256 : pos512;
 
-  // Medium & confident dots
-  const innerR = 12;
+  // Dots: medium/confident but not shouty (scaled for @2x output)
   const haloR = 20;
+  const dotR = 14;
 
-  // Label styling (scaled for @2x)
-  const fontSize = 30; // good at 2560 wide
-  const padX = 18;
-  const padY = 12;
-  const radius = 16;
+  // Number styling
+  const numFontSize = 18;
+  const numFontFamily = "Arial, Helvetica, sans-serif"; // reliable on server svg
+  const numFill = "ffffff";
+
+  // Tiny tag styling (subtle)
+  const tagFontSize = 16;
+  const tagPadX = 10;
+  const tagPadY = 6;
+  const tagRadius = 10;
+  const tagFillOpacity = 0.78; // lets map show through a bit
+  const tagTextOpacity = 0.80;
 
   const overlays = [];
 
-  // 1) labels first (so dots sit on top visually)
-  let drawnLabels = 0;
+  // 1) Tiny tags first (so dots sit on top)
+  let drawnTags = 0;
+
+  const first = positions[0];
+  const last = positions[positions.length - 1];
+
+  // START tag
+  {
+    const tag = "START";
+    const text = escapeXml(tag);
+    const tagW = Math.round(text.length * tagFontSize * 0.62 + tagPadX * 2);
+    const tagH = Math.round(tagFontSize + tagPadY * 2);
+
+    const pos = placeTinyTag({
+      x: first.x,
+      y: first.y,
+      view: actualView,
+      tagW,
+      tagH,
+      prefer: "ur"
+    });
+
+    overlays.push({
+      input: Buffer.from(`
+        <svg width="${tagW}" height="${tagH}" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0" y="0" width="${tagW}" height="${tagH}" rx="${tagRadius}" ry="${tagRadius}"
+            fill="white" fill-opacity="${tagFillOpacity}"/>
+          <text x="${tagPadX}" y="${Math.round(tagH / 2 + tagFontSize * 0.35)}"
+            font-family="${numFontFamily}" font-weight="600"
+            font-size="${tagFontSize}"
+            fill="#${SLATE}" fill-opacity="${tagTextOpacity}"
+            letter-spacing="0.5">${text}</text>
+        </svg>
+      `.trim()),
+      left: pos.left,
+      top: pos.top
+    });
+
+    drawnTags++;
+  }
+
+  // END tag (place opposite side to reduce overlap risk)
+  {
+    const tag = "END";
+    const text = escapeXml(tag);
+    const tagW = Math.round(text.length * tagFontSize * 0.62 + tagPadX * 2);
+    const tagH = Math.round(tagFontSize + tagPadY * 2);
+
+    const pos = placeTinyTag({
+      x: last.x,
+      y: last.y,
+      view: actualView,
+      tagW,
+      tagH,
+      prefer: "ul"
+    });
+
+    overlays.push({
+      input: Buffer.from(`
+        <svg width="${tagW}" height="${tagH}" xmlns="http://www.w3.org/2000/svg">
+          <rect x="0" y="0" width="${tagW}" height="${tagH}" rx="${tagRadius}" ry="${tagRadius}"
+            fill="white" fill-opacity="${tagFillOpacity}"/>
+          <text x="${tagPadX}" y="${Math.round(tagH / 2 + tagFontSize * 0.35)}"
+            font-family="${numFontFamily}" font-weight="600"
+            font-size="${tagFontSize}"
+            fill="#${SLATE}" fill-opacity="${tagTextOpacity}"
+            letter-spacing="0.5">${text}</text>
+        </svg>
+      `.trim()),
+      left: pos.left,
+      top: pos.top
+    });
+
+    drawnTags++;
+  }
+
+  // 2) Numbered dots on top
+  let drawnDots = 0;
 
   for (let i = 0; i < positions.length; i++) {
     const p = positions[i];
-    const rawLabel = labels?.[i] ?? "";
-    if (!rawLabel) continue;
-
-    const text = escapeXml(rawLabel);
-
-    // crude width estimate: fontSize * 0.62 * chars + padding
-    const labelW = Math.min(
-      Math.max(220, Math.round(text.length * fontSize * 0.62 + padX * 2)),
-      820
-    );
-    const labelH = Math.round(fontSize + padY * 2);
-
-    // Special placement for last label if it returns to start (avoid overlap)
-    let leftTop = chooseLabelPlacement({ x: p.x, y: p.y, view: actualView, labelW, labelH });
-
-    overlays.push({
-      input: Buffer.from(
-        `
-        <svg width="${labelW}" height="${labelH}" xmlns="http://www.w3.org/2000/svg">
-          <rect x="0" y="0" width="${labelW}" height="${labelH}" rx="${radius}" ry="${radius}"
-            fill="white" fill-opacity="0.86"/>
-          <text x="${padX}" y="${Math.round(labelH / 2 + fontSize * 0.35)}"
-            font-family="Arial, Helvetica, sans-serif"
-            font-size="${fontSize}"
-            fill="#${SLATE}"
-            fill-opacity="1">${text}</text>
-        </svg>
-        `.trim()
-      ),
-      left: leftTop.left,
-      top: leftTop.top
-    });
-
-    drawnLabels++;
-  }
-
-  // 2) dots on top
-  let drawnDots = 0;
-
-  for (const p of positions) {
     if (p.x < -60 || p.y < -60 || p.x > actualView.pixelWidth + 60 || p.y > actualView.pixelHeight + 60) continue;
+
+    const number = String(i + 1);
 
     const svg = `
       <svg width="${haloR * 2}" height="${haloR * 2}" xmlns="http://www.w3.org/2000/svg">
         <circle cx="${haloR}" cy="${haloR}" r="${haloR}" fill="white" fill-opacity="0.78"/>
-        <circle cx="${haloR}" cy="${haloR}" r="${innerR}" fill="#${SLATE}" fill-opacity="1"/>
+        <circle cx="${haloR}" cy="${haloR}" r="${dotR}" fill="#${SLATE}" fill-opacity="0.92"/>
+        <text x="${haloR}" y="${haloR + Math.round(numFontSize * 0.35)}"
+          text-anchor="middle"
+          font-family="${numFontFamily}"
+          font-weight="700"
+          font-size="${numFontSize}"
+          fill="#${numFill}" fill-opacity="0.95">${escapeXml(number)}</text>
       </svg>
     `.trim();
 
@@ -549,7 +589,7 @@ async function addDotsAndLabelsToPng({ pngBuffer, coords, labels, view }) {
     buffer: out,
     debug: {
       drawnDots,
-      drawnLabels,
+      drawnTags,
       tileSizeChosen,
       inBounds512: in512,
       inBounds256: in256,
@@ -864,7 +904,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let previewBaseUrl = null;
   let finalBaseUrl = null;
 
-  let mapDebug = null;
+  let renderDebug = null;
 
   let shopifyFileId = null;
   let shopifyFileUrl = null;
@@ -893,25 +933,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const coords = resolved.map((r) => r.coordinates);
 
-    // Labels aligned to coords list
-    const shortNames = cleanedPortQueries.map(shortPortLabel);
-
-    // Start/end handling (avoid two identical labels on same dot)
-    const labels = shortNames.map((n) => n);
-    if (labels.length >= 2) {
-      const first = labels[0];
-      const last = labels[labels.length - 1];
-      const sameStartEnd = first === last;
-
-      if (sameStartEnd) {
-        labels[0] = `Depart/Return: ${first}`;
-        labels[labels.length - 1] = ""; // avoid overlap
-      } else {
-        labels[0] = `Depart: ${first}`;
-        labels[labels.length - 1] = `Arrive: ${last}`;
-      }
-    }
-
     const preview = buildBaseMapUrl({ coords, width: 1200, height: 800, retina: false });
     previewBaseUrl = preview.url;
 
@@ -920,13 +941,12 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const basePng = await downloadImageToBuffer(final.url);
 
-    const rendered = await addDotsAndLabelsToPng({
+    const rendered = await addNumberedDotsAndTagsToPng({
       pngBuffer: basePng,
       coords,
-      labels,
       view: final.view
     });
-    mapDebug = rendered.debug;
+    renderDebug = rendered.debug;
 
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
     const safeDate = (sailDate || "date").replace(/[^0-9-]+/g, "");
@@ -990,7 +1010,7 @@ ${shopifyFileUrl}
         })),
         previewBaseUrl,
         finalBaseUrl,
-        render: mapDebug,
+        render: renderDebug,
         shopifyFileId,
         shopifyFileStatus,
         shopifyFileUrl
@@ -1006,7 +1026,7 @@ ${shopifyFileUrl}
     recentWebhookHits.unshift({
       at: new Date().toISOString(),
       error: String(err?.message || err),
-      map: { previewBaseUrl, finalBaseUrl, render: mapDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl }
+      map: { previewBaseUrl, finalBaseUrl, render: renderDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl }
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
