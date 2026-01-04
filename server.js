@@ -163,6 +163,7 @@ async function geocodePortFallback(portQuery) {
   const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
+  // Caribbean-ish bbox/proximity for cruise routes
   const bbox = "-90,17,-55,32";
   const proximity = "-75,23.5";
 
@@ -221,7 +222,6 @@ function cleanCoordinates(coords) {
 }
 
 function nearlySameCoord(a, b) {
-  // ~2km tolerance
   const dlng = Math.abs(a[0] - b[0]);
   const dlat = Math.abs(a[1] - b[1]);
   return dlng < 0.03 && dlat < 0.03;
@@ -443,7 +443,7 @@ function buildBaseOnlyMapUrl({ fitCoords, width = 1200, height = 800, retina = f
   };
 }
 
-/* -------------------- ART LAYERS: ROUTE MASKED BY WATER + WHITE CHEVRONS + LABELS/DOTS -------------------- */
+/* -------------------- ART LAYERS: ROUTE + CHEVRONS + LABELS/DOTS -------------------- */
 
 function escapeXml(s) {
   return String(s)
@@ -470,29 +470,7 @@ function portLabelText(resolvedPort) {
   return country ? `${portQuery}, ${country}` : portQuery;
 }
 
-function labelAnchor({ x, y, view, labelW, labelH, prefer = "ur" }) {
-  const pad = 14;
-  const gap = 22;
-
-  const ur = { left: Math.round(x + gap), top: Math.round(y - gap - labelH) };
-  const ul = { left: Math.round(x - gap - labelW), top: Math.round(y - gap - labelH) };
-  const dr = { left: Math.round(x + gap), top: Math.round(y + gap) };
-  const dl = { left: Math.round(x - gap - labelW), top: Math.round(y + gap) };
-
-  const order =
-    prefer === "ur" ? [ur, ul, dr, dl] :
-    prefer === "ul" ? [ul, ur, dl, dr] :
-    prefer === "dr" ? [dr, dl, ur, ul] :
-    [dl, dr, ul, ur];
-
-  const c = order[0];
-  return {
-    left: Math.max(pad, Math.min(c.left, view.pixelWidth - labelW - pad)),
-    top: Math.max(pad, Math.min(c.top, view.pixelHeight - labelH - pad))
-  };
-}
-
-/* --------- Label collision avoidance helpers --------- */
+/* ---------- Collision-avoid label placement ---------- */
 
 function approxTextWidthPx(text, fontSize) {
   return Math.round(Math.max(80, Math.min(980, text.length * fontSize * 0.55)));
@@ -556,8 +534,13 @@ function placeLabelsNoOverlap({ points, labels, view, fontSize }) {
     }
 
     if (!chosen) {
-      const fallback = labelAnchor({ x: p.x, y: p.y, view, labelW: w, labelH: h, prefer: "ur" });
-      chosen = { left: fallback.left, top: fallback.top, w, h };
+      const pad = 14;
+      chosen = {
+        left: Math.max(pad, Math.min(Math.round(p.x + 18), view.pixelWidth - w - pad)),
+        top: Math.max(pad, Math.min(Math.round(p.y - 18 - h), view.pixelHeight - h - pad)),
+        w,
+        h
+      };
     }
 
     placed.push(chosen);
@@ -567,19 +550,21 @@ function placeLabelsNoOverlap({ points, labels, view, fontSize }) {
   return result;
 }
 
-/* --------- Stop numbering: only ports-of-call (middle stops) --------- */
+/* ---------- Stop numbers ---------- */
+/**
+ * No number for start (index 0).
+ * Number every stop AFTER start: 1..(count-1)
+ * This matches your example: start is Port Canaveral (no number),
+ * then Grand Turk=1, Amber Cove=2, Nassau=3, Celebration Key=4.
+ */
 function makeStopNumbers(count) {
   const nums = new Array(count).fill("");
-  if (count <= 2) return nums;
-  let n = 1;
-  for (let i = 1; i <= count - 2; i++) {
-    nums[i] = String(n);
-    n++;
-  }
+  if (count <= 1) return nums;
+  for (let i = 1; i < count; i++) nums[i] = String(i);
   return nums;
 }
 
-/* --------- White chevrons --------- */
+/* ---------- White chevrons ---------- */
 function chevronSvg({ angleDeg, size = 30, opacity = 0.70, colorHex = "ffffff" }) {
   const w = size * 2;
   const h = size * 2;
@@ -606,7 +591,7 @@ function chevronSvg({ angleDeg, size = 30, opacity = 0.70, colorHex = "ffffff" }
   `.trim());
 }
 
-/* --------- Artsy route SVGs (wash + main) --------- */
+/* ---------- Artsy route SVGs (wash + main) ---------- */
 function routeSvgsFromPixelPoints({ width, height, points, seedKey }) {
   const seed = hashString(seedKey || JSON.stringify(points.slice(0, 10)));
   const rnd = makeRng(seed);
@@ -651,24 +636,32 @@ function routeSvgsFromPixelPoints({ width, height, points, seedKey }) {
   return { washSvg, mainSvg };
 }
 
-// Heuristic "water" detector for Mapbox light-v11.
-// Not perfect, but looks great in practice: lines disappear when they touch land.
+/**
+ * Water mask heuristic for mapbox/light-v11.
+ * IMPORTANT: We also compute a coverage ratio and provide a fallback to avoid masking EVERYTHING.
+ */
 function buildWaterMaskFromBaseMapRGBA(rgba, width, height) {
   const out = Buffer.alloc(width * height * 4, 0);
+
+  let waterCount = 0;
 
   for (let i = 0; i < width * height; i++) {
     const r = rgba[i * 4 + 0];
     const g = rgba[i * 4 + 1];
     const b = rgba[i * 4 + 2];
 
+    // brightness
     const y = (r * 0.2126 + g * 0.7152 + b * 0.0722);
-    const blueBias = (b - r) + (b - g);
-    const greenBias = (g - r);
 
+    // water-ish tends to have a slight blue/cyan bias in light-v11
+    const blueBias = (b - r) + (b - g);
+    const bOverRG = (b > r + 6) && (b > g + 4);
+
+    // Slightly looser rules than before (prevents full wipeout)
     const isWater =
-      (y > 120 && blueBias > 18) ||
-      (y > 150 && (b - r) > 10 && (b - g) > 6) ||
-      (y > 170 && blueBias > 8 && greenBias > 6);
+      (y > 105 && blueBias > 10) ||
+      (y > 130 && bOverRG) ||
+      (y > 155 && blueBias > 6);
 
     const alpha = isWater ? 255 : 0;
 
@@ -676,9 +669,12 @@ function buildWaterMaskFromBaseMapRGBA(rgba, width, height) {
     out[i * 4 + 1] = 255;
     out[i * 4 + 2] = 255;
     out[i * 4 + 3] = alpha;
+
+    if (isWater) waterCount++;
   }
 
-  return out;
+  const coverage = waterCount / (width * height);
+  return { maskRgba: out, coverage };
 }
 
 async function addRouteMaskedDotsLabelsChevrons({
@@ -711,15 +707,17 @@ async function addRouteMaskedDotsLabelsChevrons({
   const arrowPos256 = computePositions({ coords: routeCoordsForArrows, view: actualView, tileSize: 256 });
   const arrowPositions = tileSizeChosen === 256 ? arrowPos256 : arrowPos512;
 
-  // ---- 1) Build water mask from the base map pixels ----
+  // ---- 1) Build water mask from base map pixels, with coverage ----
   const { data: rgba } = await sharp(pngBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const waterMaskRGBA = buildWaterMaskFromBaseMapRGBA(rgba, actualW, actualH);
+
+  const { maskRgba: waterMaskRGBA, coverage: waterCoverage } =
+    buildWaterMaskFromBaseMapRGBA(rgba, actualW, actualH);
 
   const waterMaskPng = await sharp(waterMaskRGBA, {
     raw: { width: actualW, height: actualH, channels: 4 }
   }).png().toBuffer();
 
-  // ---- 2) Build artsy route layer (wash + main), then mask it to water ----
+  // ---- 2) Build artsy route layer (wash + main) ----
   const dense = densifyRoute(routeCoordsForLine, 22);
   const jittered = jitterRoute(dense, seedKey, 9);
 
@@ -760,15 +758,19 @@ async function addRouteMaskedDotsLabelsChevrons({
     .png()
     .toBuffer();
 
-  const routeMasked = await sharp(routeLayer)
-    .composite([{ input: waterMaskPng, left: 0, top: 0, blend: "dest-in" }])
-    .png()
-    .toBuffer();
+  // ---- 3) Mask route so it "goes behind land", BUT add fallback if mask is too aggressive ----
+  // If coverage is suspiciously low, do NOT mask (prevents missing line).
+  const shouldMask = waterCoverage > 0.10; // loose guard; Caribbean maps typically have plenty of water
 
-  // ---- 3) Composite: route (masked) + chevrons + labels + dots ----
+  const routeMasked = shouldMask
+    ? await sharp(routeLayer)
+        .composite([{ input: waterMaskPng, left: 0, top: 0, blend: "dest-in" }])
+        .png()
+        .toBuffer()
+    : routeLayer;
+
+  // ---- 4) Composite route + chevrons + labels + dots ----
   const overlays = [];
-
-  // Route masked goes first
   overlays.push({ input: routeMasked, left: 0, top: 0 });
 
   // Chevrons (white)
@@ -790,11 +792,10 @@ async function addRouteMaskedDotsLabelsChevrons({
       const cy = a.y + dy * t;
 
       overlays.push({
-        input: chevronSvg({ angleDeg, size: 30, opacity: 0.70, colorHex: "ffffff" }),
+        input: chevronSvg({ angleDeg, size: 30, opacity: 0.72, colorHex: "ffffff" }),
         left: Math.round(cx - 30),
         top: Math.round(cy - 30)
       });
-
       drawnChevrons++;
     }
   }
@@ -842,10 +843,10 @@ async function addRouteMaskedDotsLabelsChevrons({
     drawnLabels++;
   }
 
-  // Dots + stop numbers (middle only)
+  // Dots + stop numbers (no number for start, numbers for all ports after start)
   const haloR = 20;
   const dotR = 13;
-  const numFontSize = 18;
+  const numFontSize = 16;
 
   const stopNums = makeStopNumbers(displayPositions.length);
 
@@ -861,12 +862,17 @@ async function addRouteMaskedDotsLabelsChevrons({
           <circle cx="${haloR}" cy="${haloR}" r="${haloR}" fill="white" fill-opacity="0.70"/>
           <circle cx="${haloR}" cy="${haloR}" r="${dotR}" fill="#${SLATE}" fill-opacity="0.92"/>
           ${showNum ? `
-            <text x="${haloR}" y="${haloR + Math.round(numFontSize * 0.35)}"
+            <text x="${haloR}" y="${haloR}"
               text-anchor="middle"
+              dominant-baseline="middle"
               font-family="${fontFamily}"
-              font-weight="900"
+              font-weight="800"
               font-size="${numFontSize}"
-              fill="#ffffff" fill-opacity="0.95">${escapeXml(num)}</text>
+              fill="#ffffff" fill-opacity="0.95"
+              paint-order="stroke"
+              stroke="#${SLATE}"
+              stroke-opacity="0.35"
+              stroke-width="1.2">${escapeXml(num)}</text>
           ` : ``}
         </svg>
       `.trim()),
@@ -887,7 +893,11 @@ async function addRouteMaskedDotsLabelsChevrons({
       drawnChevrons,
       drawnLabels,
       drawnDots,
-      displayStopCount: displayPositions.length
+      displayStopCount: displayPositions.length,
+      waterMask: {
+        coverage: Number(waterCoverage.toFixed(4)),
+        maskedEnabled: shouldMask
+      }
     }
   };
 }
@@ -1259,7 +1269,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
     });
     renderDebug = rendered.debug;
 
-    // unique filename prevents Shopify caching weirdness
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
     const safeDate = (sailDate || "date").replace(/[^0-9-]+/g, "");
     const uniq = Date.now();
