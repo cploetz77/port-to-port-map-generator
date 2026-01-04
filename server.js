@@ -19,7 +19,7 @@ app.get("/debug/webhooks", (req, res) => {
   res.send(JSON.stringify(recentWebhookHits, null, 2));
 });
 
-/* -------------------- SHOPIFY LINE ITEM PROPERTY PARSING -------------------- */
+/* --------------------- SHOPIFY LINE ITEM PROPERTY PARSING --------------------- */
 
 function extractLineItemProperties(lineItem) {
   const props = [];
