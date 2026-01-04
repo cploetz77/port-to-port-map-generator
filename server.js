@@ -137,7 +137,6 @@ const PINNED_PORT_COORDS = {
   "Nassau, Bahamas": [-77.355, 25.078],
   "Grand Bahama Island, Bahamas": [-78.65, 26.533],
 
-  // Celebration Key coordinates from port listings
   "Celebration Key, Bahamas": [-78.498, 26.57]
 };
 
@@ -152,7 +151,6 @@ function normalizePortText(raw) {
   const lower = s.toLowerCase();
 
   if (lower.includes("celebration key") || lower.includes("celebration cay")) {
-    // Keep the itinerary name; do NOT rename to Grand Bahama
     return "Celebration Key, Bahamas";
   }
 
@@ -162,7 +160,6 @@ function normalizePortText(raw) {
     return "Amber Cove, Dominican Republic";
   if (lower.includes("nassau")) return "Nassau, Bahamas";
 
-  // still keep "Grand Bahama..." if itinerary explicitly says it (not Celebration Key)
   if (lower.includes("grand bahama")) return "Grand Bahama Island, Bahamas";
 
   s = s.replace(/\s+/g, " ").trim();
@@ -238,13 +235,12 @@ function cleanCoordinates(coords) {
   return cleaned;
 }
 
-/* -------------------- ROUTE SMOOTHING (LESS RIGID LINE) -------------------- */
+/* -------------------- ROUTE SMOOTHING / “HAND DRAWN” VIBE -------------------- */
 
 function deg2rad(d) { return (d * Math.PI) / 180; }
 function rad2deg(r) { return (r * 180) / Math.PI; }
 
 function slerpGreatCircle(a, b, t) {
-  // a,b in [lng,lat]
   const [lng1, lat1] = a.map(deg2rad);
   const [lng2, lat2] = b.map(deg2rad);
 
@@ -292,6 +288,67 @@ function densifyRoute(coords, pointsPerLeg = 18) {
     }
     out.push(b);
   }
+  return out;
+}
+
+function hashString(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function makeRng(seed) {
+  // deterministic LCG
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+// Adds a gentle perpendicular “hand-drawn” wobble to dense route points (visual only)
+function jitterRoute(routeCoords, seedKey, amplitudeKm = 7) {
+  const coords = cleanCoordinates(routeCoords);
+  if (coords.length < 3) return coords;
+
+  const seed = hashString(seedKey || JSON.stringify(coords.slice(0, 5)));
+  const rnd = makeRng(seed);
+
+  const out = [coords[0]];
+  for (let i = 1; i < coords.length - 1; i++) {
+    const prev = coords[i - 1];
+    const curr = coords[i];
+    const next = coords[i + 1];
+
+    const lng = curr[0];
+    const lat = curr[1];
+
+    // tangent direction in degrees
+    const dx = next[0] - prev[0];
+    const dy = next[1] - prev[1];
+
+    // perpendicular normal
+    const len = Math.sqrt(dx*dx + dy*dy) || 1e-6;
+    const nx = -dy / len;
+    const ny = dx / len;
+
+    // random signed offset scaled down so it's subtle
+    const r = (rnd() - 0.5) * 2; // [-1..1]
+    const localAmpKm = amplitudeKm * (0.25 + 0.75 * Math.abs(rnd() - 0.5) * 2);
+
+    // convert km to degrees approximately
+    const dLat = (localAmpKm / 111) * r;
+    const dLng = (localAmpKm / (111 * Math.cos(deg2rad(lat)) || 1)) * r;
+
+    const jLng = lng + nx * dLng;
+    const jLat = lat + ny * dLat;
+
+    out.push([jLng, jLat]);
+  }
+  out.push(coords[coords.length - 1]);
   return out;
 }
 
@@ -382,7 +439,7 @@ const MAPBOX_STYLE_ID = "mapbox/light-v11";
 const ROUTE_TEAL = "0aa6a6";
 const SLATE = "2f3b45";
 
-function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false }) {
+function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false, seedKey = "" }) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
 
@@ -392,19 +449,27 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
 
-  // Smooth path points (visual only)
-  const routeCoords = densifyRoute(cleaned, 18);
-  const poly = encodePolylineLngLat(routeCoords);
-  const polyEnc = encodeURIComponent(poly);
+  // Smooth + "hand-drawn" path points (visual only)
+  const dense = densifyRoute(cleaned, 18);
+  const jittered = jitterRoute(dense, seedKey || JSON.stringify(cleaned), 7);
 
-  // two-layer route: soft halo + main
-  const routeHalo = `path-10+${SLATE}-0.14(${polyEnc})`;
-  const routeMain = `path-5+${ROUTE_TEAL}-0.80(${polyEnc})`;
+  const polyDense = encodeURIComponent(encodePolylineLngLat(dense));
+  const polyJitter = encodeURIComponent(encodePolylineLngLat(jittered));
+
+  // Layered route for an artsy vibe
+  // - very soft ink wash underlay
+  // - subtle dark halo
+  // - main teal stroke
+  // - faint jittered teal stroke on top (adds “hand drawn” life)
+  const wash = `path-18+${ROUTE_TEAL}-0.10(${polyJitter})`;
+  const halo = `path-10+${SLATE}-0.12(${polyDense})`;
+  const main = `path-5+${ROUTE_TEAL}-0.80(${polyDense})`;
+  const sketch = `path-3+${ROUTE_TEAL}-0.42(${polyJitter})`;
 
   // Fit map based on *actual port stops*
-  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 150);
+  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 155);
 
-  const overlay = `${routeHalo},${routeMain}`;
+  const overlay = `${wash},${halo},${main},${sketch}`;
   const sizePart = retina ? `${width}x${height}@2x` : `${width}x${height}`;
 
   const url = `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
@@ -424,7 +489,7 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false })
   };
 }
 
-/* -------------------- ARTSY LABELS + CORRECT STOP NUMBERS -------------------- */
+/* -------------------- ARTSY LABELS + ARROWS + CORRECT STOP NUMBERS -------------------- */
 
 function lngLatToPixel({ lng, lat, view, tileSize }) {
   const scale = tileSize * Math.pow(2, view.zoom) * (view.pixelRatio || 1);
@@ -481,8 +546,6 @@ function portLabelText(resolvedPort) {
   const portQuery = resolvedPort?.portQuery || "";
   const placeName = resolvedPort?.placeName || "";
 
-  // If portQuery already has country, keep it tight:
-  // e.g., "Nassau, Bahamas" or "Celebration Key, Bahamas"
   if (portQuery.includes(",")) return portQuery;
 
   const country = countryFromPlaceName(placeName);
@@ -490,7 +553,6 @@ function portLabelText(resolvedPort) {
 }
 
 function labelAnchor({ x, y, view, labelW, labelH, prefer = "ur" }) {
-  // label offset and edge-clamp (no big pill, just text + halo)
   const pad = 14;
   const gap = 22;
 
@@ -511,11 +573,12 @@ function labelAnchor({ x, y, view, labelW, labelH, prefer = "ur" }) {
   return { left, top };
 }
 
-function makeStopNumbers(count) {
+function makeStopNumbers(count, isRoundTrip) {
   // Correct rules:
   // - index 0 is embark (no number)
-  // - index last is disembark (no number)
+  // - last index is disembark (no number)
   // - middle ports get 1..K
+  // Works for round trip too (last stop still unnumbered)
   const nums = new Array(count).fill("");
   if (count <= 2) return nums;
 
@@ -527,10 +590,49 @@ function makeStopNumbers(count) {
   return nums;
 }
 
-async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, view }) {
+function nearlySameCoord(a, b) {
+  // ~2km tolerance
+  const dlng = Math.abs(a[0] - b[0]);
+  const dlat = Math.abs(a[1] - b[1]);
+  return dlng < 0.03 && dlat < 0.03;
+}
+
+function arrowOverlaySvg({ cx, cy, angleDeg, size = 22, opacity = 0.35, colorHex = SLATE }) {
+  // A minimal chevron-style arrow (two strokes) feels “artsy” without shouting
+  const w = size * 2;
+  const h = size * 2;
+  const x0 = size;
+  const y0 = size;
+
+  // Chevron points in local coords pointing RIGHT
+  const len = size * 0.9;
+  const wing = size * 0.35;
+
+  const x1 = x0 - len * 0.45;
+  const x2 = x0 + len * 0.45;
+  const yUp = y0 - wing;
+  const yDn = y0 + wing;
+
+  return {
+    input: Buffer.from(`
+      <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+        <g transform="rotate(${angleDeg.toFixed(2)} ${x0} ${y0})">
+          <line x1="${x1}" y1="${yUp}" x2="${x2}" y2="${y0}"
+            stroke="#${colorHex}" stroke-opacity="${opacity}" stroke-width="4" stroke-linecap="round"/>
+          <line x1="${x1}" y1="${yDn}" x2="${x2}" y2="${y0}"
+            stroke="#${colorHex}" stroke-opacity="${opacity}" stroke-width="4" stroke-linecap="round"/>
+        </g>
+      </svg>
+    `.trim()),
+    left: Math.round(cx - size),
+    top: Math.round(cy - size)
+  };
+}
+
+async function addArtsyDotsNumbersLabelsArrows({ pngBuffer, coords, resolvedPorts, view }) {
   const cleaned = cleanCoordinates(coords);
   if (cleaned.length < 1) {
-    return { buffer: pngBuffer, debug: { drawnDots: 0, drawnLabels: 0, drawnTags: 0 } };
+    return { buffer: pngBuffer, debug: { drawnDots: 0, drawnLabels: 0, drawnTags: 0, drawnArrows: 0 } };
   }
 
   const meta = await sharp(pngBuffer).metadata();
@@ -548,81 +650,99 @@ async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, vie
   const tileSizeChosen = in256 > in512 ? 256 : 512;
   const positions = tileSizeChosen === 256 ? pos256 : pos512;
 
+  const isRoundTrip =
+    (resolvedPorts?.[0]?.portQuery && resolvedPorts?.[resolvedPorts.length - 1]?.portQuery &&
+      resolvedPorts[0].portQuery === resolvedPorts[resolvedPorts.length - 1].portQuery) ||
+    nearlySameCoord(cleaned[0], cleaned[cleaned.length - 1]);
+
   // Visual system (scaled for @2x)
   const haloR = 20;
   const dotR = 13;
 
   // Numbers inside dot (only ports of call)
   const numFontSize = 18;
-  const numFamily = "Arial, Helvetica, sans-serif";
+  const fontFamily = "Arial, Helvetica, sans-serif";
 
-  // Label style: text only, with a subtle white stroke (halo) so it reads on map
-  const labelFontSize = 22;
+  // Label style: smaller + softer + more “blended”
+  const labelFontSize = 20;
   const labelWeight = 600;
-  const labelOpacity = 0.84;
+  const labelOpacity = 0.78;
+  const labelStrokeOpacity = 0.80;
+  const labelStrokeWidth = 4;
 
-  // Tiny START/END tag
+  // Tiny tags
   const tagFontSize = 16;
   const tagPadX = 10;
   const tagPadY = 6;
   const tagRadius = 10;
-  const tagFillOpacity = 0.72;
-  const tagTextOpacity = 0.80;
+  const tagFillOpacity = 0.70;
+  const tagTextOpacity = 0.78;
 
   const overlays = [];
 
-  // Build label strings
+  // Label strings
   const labels = (resolvedPorts || []).map(portLabelText);
 
   // Stop numbers (corrected)
-  const stopNums = makeStopNumbers(positions.length);
+  const stopNums = makeStopNumbers(positions.length, isRoundTrip);
 
-  // 1) Draw labels first (so dots sit on top)
+  // 0) Direction arrows (behind labels + dots)
+  let drawnArrows = 0;
+  for (let i = 0; i < positions.length - 1; i++) {
+    const a = positions[i];
+    const b = positions[i + 1];
+
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+
+    if (!Number.isFinite(dist) || dist < 40) continue;
+
+    // Place arrow at ~60% along the leg (keeps it away from dot/label congestion)
+    const t = 0.60;
+    const cx = a.x + dx * t;
+    const cy = a.y + dy * t;
+
+    const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+
+    overlays.push(arrowOverlaySvg({
+      cx,
+      cy,
+      angleDeg,
+      size: 20,
+      opacity: 0.28,          // subtle
+      colorHex: SLATE
+    }));
+
+    drawnArrows++;
+  }
+
+  // 1) Labels (text + faint leader line)
   let drawnLabels = 0;
-
   for (let i = 0; i < positions.length; i++) {
     const p = positions[i];
     const label = labels[i] || "";
     if (!label) continue;
 
-    // very rough width estimate
     const approxW = Math.min(Math.max(220, Math.round(label.length * labelFontSize * 0.55)), 980);
     const labelW = approxW;
-    const labelH = Math.round(labelFontSize * 1.3);
+    const labelH = Math.round(labelFontSize * 1.35);
 
-    // Alternate preference by index to reduce overlaps
     const prefer = i % 2 === 0 ? "ur" : "ul";
     const anchor = labelAnchor({ x: p.x, y: p.y, view: actualView, labelW, labelH, prefer });
 
-    // A tiny leader line to make it feel more “designed” and reduce ambiguity
+    // faint leader line
     const lineX1 = Math.round(p.x);
     const lineY1 = Math.round(p.y);
-    const lineX2 = Math.round(anchor.left + 8);
-    const lineY2 = Math.round(anchor.top + Math.round(labelH * 0.75));
+    const lineX2 = Math.round(anchor.left + 6);
+    const lineY2 = Math.round(anchor.top + Math.round(labelH * 0.78));
 
-    const svg = `
-      <svg width="${labelW}" height="${labelH}" xmlns="http://www.w3.org/2000/svg">
-        <text x="0" y="${Math.round(labelH * 0.85)}"
-          font-family="${numFamily}"
-          font-weight="${labelWeight}"
-          font-size="${labelFontSize}"
-          fill="#${SLATE}"
-          fill-opacity="${labelOpacity}"
-          paint-order="stroke"
-          stroke="white"
-          stroke-width="5"
-          stroke-opacity="0.85"
-          stroke-linejoin="round">${escapeXml(label)}</text>
-      </svg>
-    `.trim();
-
-    // leader line is a separate overlay so it can extend outside the label box
     overlays.push({
       input: Buffer.from(`
         <svg width="${actualView.pixelWidth}" height="${actualView.pixelHeight}" xmlns="http://www.w3.org/2000/svg">
           <line x1="${lineX1}" y1="${lineY1}" x2="${lineX2}" y2="${lineY2}"
-            stroke="#${SLATE}" stroke-opacity="0.25" stroke-width="3" stroke-linecap="round"/>
-          <circle cx="${lineX2}" cy="${lineY2}" r="4" fill="#${SLATE}" fill-opacity="0.25"/>
+            stroke="#${SLATE}" stroke-opacity="0.20" stroke-width="3" stroke-linecap="round"/>
+          <circle cx="${lineX2}" cy="${lineY2}" r="3.5" fill="#${SLATE}" fill-opacity="0.18"/>
         </svg>
       `.trim()),
       left: 0,
@@ -630,7 +750,21 @@ async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, vie
     });
 
     overlays.push({
-      input: Buffer.from(svg),
+      input: Buffer.from(`
+        <svg width="${labelW}" height="${labelH}" xmlns="http://www.w3.org/2000/svg">
+          <text x="0" y="${Math.round(labelH * 0.86)}"
+            font-family="${fontFamily}"
+            font-weight="${labelWeight}"
+            font-size="${labelFontSize}"
+            fill="#${SLATE}"
+            fill-opacity="${labelOpacity}"
+            paint-order="stroke"
+            stroke="white"
+            stroke-width="${labelStrokeWidth}"
+            stroke-opacity="${labelStrokeOpacity}"
+            stroke-linejoin="round">${escapeXml(label)}</text>
+        </svg>
+      `.trim()),
       left: anchor.left,
       top: anchor.top
     });
@@ -638,7 +772,7 @@ async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, vie
     drawnLabels++;
   }
 
-  // 2) START/END tags (small)
+  // 2) Tags: START/END unless round trip (then one tag only)
   let drawnTags = 0;
   if (positions.length >= 1) {
     const first = positions[0];
@@ -655,7 +789,7 @@ async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, vie
             <rect x="0" y="0" width="${w}" height="${h}" rx="${tagRadius}" ry="${tagRadius}"
               fill="white" fill-opacity="${tagFillOpacity}"/>
             <text x="${tagPadX}" y="${Math.round(h / 2 + tagFontSize * 0.35)}"
-              font-family="${numFamily}" font-weight="700"
+              font-family="${fontFamily}" font-weight="800"
               font-size="${tagFontSize}"
               fill="#${SLATE}" fill-opacity="${tagTextOpacity}"
               letter-spacing="0.6">${escapeXml(text)}</text>
@@ -664,16 +798,20 @@ async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, vie
         left: pos.left,
         top: pos.top
       });
+
       drawnTags++;
     };
 
-    makeTag("START", first.x, first.y, "dr");
-    makeTag("END", last.x, last.y, "dl");
+    if (isRoundTrip) {
+      makeTag("DEPART/RETURN", first.x, first.y, "dr");
+    } else {
+      makeTag("START", first.x, first.y, "dr");
+      makeTag("END", last.x, last.y, "dl");
+    }
   }
 
   // 3) Dots + stop numbers on top
   let drawnDots = 0;
-
   for (let i = 0; i < positions.length; i++) {
     const p = positions[i];
     if (p.x < -60 || p.y < -60 || p.x > actualView.pixelWidth + 60 || p.y > actualView.pixelHeight + 60) continue;
@@ -681,25 +819,23 @@ async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, vie
     const num = stopNums[i]; // "" for start/end
     const showNum = Boolean(num);
 
-    const svg = `
-      <svg width="${haloR * 2}" height="${haloR * 2}" xmlns="http://www.w3.org/2000/svg">
-        <circle cx="${haloR}" cy="${haloR}" r="${haloR}" fill="white" fill-opacity="0.72"/>
-        <circle cx="${haloR}" cy="${haloR}" r="${dotR}" fill="#${SLATE}" fill-opacity="0.92"/>
-        ${
-          showNum
-            ? `<text x="${haloR}" y="${haloR + Math.round(numFontSize * 0.35)}"
-                text-anchor="middle"
-                font-family="${numFamily}"
-                font-weight="800"
-                font-size="${numFontSize}"
-                fill="#ffffff" fill-opacity="0.95">${escapeXml(num)}</text>`
-            : ``
-        }
-      </svg>
-    `.trim();
-
     overlays.push({
-      input: Buffer.from(svg),
+      input: Buffer.from(`
+        <svg width="${haloR * 2}" height="${haloR * 2}" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="${haloR}" cy="${haloR}" r="${haloR}" fill="white" fill-opacity="0.70"/>
+          <circle cx="${haloR}" cy="${haloR}" r="${dotR}" fill="#${SLATE}" fill-opacity="0.92"/>
+          ${
+            showNum
+              ? `<text x="${haloR}" y="${haloR + Math.round(numFontSize * 0.35)}"
+                  text-anchor="middle"
+                  font-family="${fontFamily}"
+                  font-weight="900"
+                  font-size="${numFontSize}"
+                  fill="#ffffff" fill-opacity="0.95">${escapeXml(num)}</text>`
+              : ``
+          }
+        </svg>
+      `.trim()),
       left: Math.round(p.x - haloR),
       top: Math.round(p.y - haloR)
     });
@@ -712,9 +848,11 @@ async function addArtsyDotsNumbersLabels({ pngBuffer, coords, resolvedPorts, vie
   return {
     buffer: out,
     debug: {
+      isRoundTrip,
       drawnDots,
       drawnLabels,
       drawnTags,
+      drawnArrows,
       tileSizeChosen,
       inBounds512: in512,
       inBounds256: in256,
@@ -1058,15 +1196,18 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const coords = resolved.map((r) => r.coordinates);
 
-    const preview = buildBaseMapUrl({ coords, width: 1200, height: 800, retina: false });
+    // seed key ensures route jitter is stable per itinerary
+    const seedKey = `${shipName || ""}|${sailDate || ""}|${cleanedPortQueries.join(" > ")}`;
+
+    const preview = buildBaseMapUrl({ coords, width: 1200, height: 800, retina: false, seedKey });
     previewBaseUrl = preview.url;
 
-    const final = buildBaseMapUrl({ coords, width: 1280, height: 853, retina: true });
+    const final = buildBaseMapUrl({ coords, width: 1280, height: 853, retina: true, seedKey });
     finalBaseUrl = final.url;
 
     const basePng = await downloadImageToBuffer(final.url);
 
-    const rendered = await addArtsyDotsNumbersLabels({
+    const rendered = await addArtsyDotsNumbersLabelsArrows({
       pngBuffer: basePng,
       coords,
       resolvedPorts: resolved,
