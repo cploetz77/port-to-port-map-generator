@@ -10,12 +10,9 @@ const recentWebhookHits = [];
 // Simple in-memory cache for geocoding (saves $$ + avoids jitter)
 const geocodeCache = new Map();
 
-// Shopify payloads can be large
 app.use(express.json({ limit: "4mb" }));
 
-app.get("/", (req, res) => {
-  res.send("Savvy Cruiser Map Generator is running");
-});
+app.get("/", (req, res) => res.send("Savvy Cruiser Map Generator is running"));
 
 app.get("/debug/webhooks", (req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -112,7 +109,6 @@ function extractPortsFromStops(obj) {
   });
 
   const ports = [];
-
   for (const k of keys) {
     const text = String(obj[k] || "").trim();
     if (!text) continue;
@@ -123,20 +119,17 @@ function extractPortsFromStops(obj) {
       ports.push(text);
     }
   }
-
   return ports;
 }
 
 /* -------------------- PORT NORMALIZATION / GEOCODE -------------------- */
 
-// Pin known ports (and fix Celebration Key explicitly)
 const PINNED_PORT_COORDS = {
   "Port Canaveral, Florida": [-80.6056, 28.41],
   "Grand Turk Cruise Center, Turks and Caicos": [-71.142, 21.4643],
   "Amber Cove, Dominican Republic": [-70.15, 19.833],
   "Nassau, Bahamas": [-77.355, 25.078],
   "Grand Bahama Island, Bahamas": [-78.65, 26.533],
-
   "Celebration Key, Bahamas": [-78.498, 26.57]
 };
 
@@ -156,14 +149,11 @@ function normalizePortText(raw) {
 
   if (lower.includes("port canaveral")) return "Port Canaveral, Florida";
   if (lower.includes("grand turk")) return "Grand Turk Cruise Center, Turks and Caicos";
-  if (lower.includes("amber cove") || lower.includes("puerto plata-amber cove"))
-    return "Amber Cove, Dominican Republic";
+  if (lower.includes("amber cove") || lower.includes("puerto plata-amber cove")) return "Amber Cove, Dominican Republic";
   if (lower.includes("nassau")) return "Nassau, Bahamas";
-
   if (lower.includes("grand bahama")) return "Grand Bahama Island, Bahamas";
 
-  s = s.replace(/\s+/g, " ").trim();
-  return s;
+  return s.replace(/\s+/g, " ").trim();
 }
 
 async function geocodePortFallback(portQuery) {
@@ -173,7 +163,6 @@ async function geocodePortFallback(portQuery) {
   const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
-  // Caribbean-ish bbox to reduce wrong hemisphere matches
   const bbox = "-90,17,-55,32";
   const proximity = "-75,23.5";
 
@@ -212,11 +201,7 @@ async function geocodePortFallback(portQuery) {
 
 async function resolvePort(portQuery) {
   if (PINNED_PORT_COORDS[portQuery]) {
-    return {
-      portQuery,
-      placeName: portQuery,
-      coordinates: PINNED_PORT_COORDS[portQuery]
-    };
+    return { portQuery, placeName: portQuery, coordinates: PINNED_PORT_COORDS[portQuery] };
   }
   return geocodePortFallback(portQuery);
 }
@@ -235,7 +220,14 @@ function cleanCoordinates(coords) {
   return cleaned;
 }
 
-/* -------------------- ROUTE SMOOTHING / “HAND DRAWN” VIBE -------------------- */
+function nearlySameCoord(a, b) {
+  // ~2km tolerance
+  const dlng = Math.abs(a[0] - b[0]);
+  const dlat = Math.abs(a[1] - b[1]);
+  return dlng < 0.03 && dlat < 0.03;
+}
+
+/* -------------------- ROUTE “ARTSY” PATH (SMOOTH + JITTER) -------------------- */
 
 function deg2rad(d) { return (d * Math.PI) / 180; }
 function rad2deg(r) { return (r * 180) / Math.PI; }
@@ -281,7 +273,6 @@ function densifyRoute(coords, pointsPerLeg = 18) {
     const a = c[i];
     const b = c[i + 1];
     if (i === 0) out.push(a);
-
     for (let j = 1; j <= pointsPerLeg; j++) {
       const t = j / (pointsPerLeg + 1);
       out.push(slerpGreatCircle(a, b, t));
@@ -301,7 +292,6 @@ function hashString(str) {
 }
 
 function makeRng(seed) {
-  // deterministic LCG
   let s = seed >>> 0;
   return () => {
     s = (Math.imul(1664525, s) + 1013904223) >>> 0;
@@ -309,8 +299,7 @@ function makeRng(seed) {
   };
 }
 
-// Adds a gentle perpendicular “hand-drawn” wobble to dense route points (visual only)
-function jitterRoute(routeCoords, seedKey, amplitudeKm = 7) {
+function jitterRoute(routeCoords, seedKey, amplitudeKm = 9) {
   const coords = cleanCoordinates(routeCoords);
   if (coords.length < 3) return coords;
 
@@ -326,27 +315,19 @@ function jitterRoute(routeCoords, seedKey, amplitudeKm = 7) {
     const lng = curr[0];
     const lat = curr[1];
 
-    // tangent direction in degrees
     const dx = next[0] - prev[0];
     const dy = next[1] - prev[1];
-
-    // perpendicular normal
     const len = Math.sqrt(dx*dx + dy*dy) || 1e-6;
     const nx = -dy / len;
     const ny = dx / len;
 
-    // random signed offset scaled down so it's subtle
-    const r = (rnd() - 0.5) * 2; // [-1..1]
+    const r = (rnd() - 0.5) * 2;
     const localAmpKm = amplitudeKm * (0.25 + 0.75 * Math.abs(rnd() - 0.5) * 2);
 
-    // convert km to degrees approximately
     const dLat = (localAmpKm / 111) * r;
     const dLng = (localAmpKm / (111 * Math.cos(deg2rad(lat)) || 1)) * r;
 
-    const jLng = lng + nx * dLng;
-    const jLat = lat + ny * dLat;
-
-    out.push([jLng, jLat]);
+    out.push([lng + nx * dLng, lat + ny * dLat]);
   }
   out.push(coords[coords.length - 1]);
   return out;
@@ -408,7 +389,6 @@ function computeBounds(coords) {
 
 function computeCenterZoom(coords, width, height, padding = 140) {
   const { minLng, maxLng, minLat, maxLat } = computeBounds(coords);
-
   const centerLng = (minLng + maxLng) / 2;
   const centerLat = (minLat + maxLat) / 2;
 
@@ -432,42 +412,35 @@ function computeCenterZoom(coords, width, height, padding = 140) {
   return { centerLng, centerLat, zoom: Number(zoom.toFixed(2)) };
 }
 
-/**
- * Theme
- */
 const MAPBOX_STYLE_ID = "mapbox/light-v11";
 const ROUTE_TEAL = "0aa6a6";
 const SLATE = "2f3b45";
 
-function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false, seedKey = "" }) {
+function buildBaseMapUrl({ displayCoords, routeCoords, width = 1200, height = 800, retina = false, seedKey = "" }) {
   const token = process.env.MAPBOX_TOKEN;
   if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
-
   if (width < 1 || width > 1280) throw new Error("Width must be between 1-1280.");
   if (height < 1 || height > 1280) throw new Error("Height must be between 1-1280.");
 
-  const cleaned = cleanCoordinates(coords);
-  if (cleaned.length < 2) throw new Error("Not enough valid coordinates to draw route.");
+  const fitCoords = cleanCoordinates(displayCoords);
+  const drawCoords = cleanCoordinates(routeCoords);
 
-  // Smooth + "hand-drawn" path points (visual only)
-  const dense = densifyRoute(cleaned, 18);
-  const jittered = jitterRoute(dense, seedKey || JSON.stringify(cleaned), 7);
+  if (fitCoords.length < 2) throw new Error("Not enough valid coordinates to fit map.");
+  if (drawCoords.length < 2) throw new Error("Not enough valid coordinates to draw route.");
+
+  const dense = densifyRoute(drawCoords, 18);
+  const jittered = jitterRoute(dense, seedKey || JSON.stringify(drawCoords), 9);
 
   const polyDense = encodeURIComponent(encodePolylineLngLat(dense));
   const polyJitter = encodeURIComponent(encodePolylineLngLat(jittered));
 
-  // Layered route for an artsy vibe
-  // - very soft ink wash underlay
-  // - subtle dark halo
-  // - main teal stroke
-  // - faint jittered teal stroke on top (adds “hand drawn” life)
-  const wash = `path-18+${ROUTE_TEAL}-0.10(${polyJitter})`;
-  const halo = `path-10+${SLATE}-0.12(${polyDense})`;
-  const main = `path-5+${ROUTE_TEAL}-0.80(${polyDense})`;
-  const sketch = `path-3+${ROUTE_TEAL}-0.42(${polyJitter})`;
+  // More obvious “artsy” layering
+  const wash = `path-20+${ROUTE_TEAL}-0.12(${polyJitter})`;
+  const halo = `path-12+${SLATE}-0.14(${polyDense})`;
+  const main = `path-6+${ROUTE_TEAL}-0.84(${polyDense})`;
+  const sketch = `path-4+${ROUTE_TEAL}-0.55(${polyJitter})`;
 
-  // Fit map based on *actual port stops*
-  const { centerLng, centerLat, zoom } = computeCenterZoom(cleaned, width, height, 155);
+  const { centerLng, centerLat, zoom } = computeCenterZoom(fitCoords, width, height, 155);
 
   const overlay = `${wash},${halo},${main},${sketch}`;
   const sizePart = retina ? `${width}x${height}@2x` : `${width}x${height}`;
@@ -475,21 +448,17 @@ function buildBaseMapUrl({ coords, width = 1200, height = 800, retina = false, s
   const url = `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
 
   const pixelRatio = retina ? 2 : 1;
-
   return {
     url,
     view: {
-      centerLng,
-      centerLat,
-      zoom,
-      pixelRatio,
+      centerLng, centerLat, zoom, pixelRatio,
       requestedPixelWidth: width * pixelRatio,
       requestedPixelHeight: height * pixelRatio
     }
   };
 }
 
-/* -------------------- ARTSY LABELS + ARROWS + CORRECT STOP NUMBERS -------------------- */
+/* -------------------- LABELS + CHEVRONS (SHARP COMPOSITE) -------------------- */
 
 function lngLatToPixel({ lng, lat, view, tileSize }) {
   const scale = tileSize * Math.pow(2, view.zoom) * (view.pixelRatio || 1);
@@ -504,10 +473,7 @@ function lngLatToPixel({ lng, lat, view, tileSize }) {
   const dx = dxWorld * scale;
   const dy = (p.y - c.y) * scale;
 
-  const x = view.pixelWidth / 2 + dx;
-  const y = view.pixelHeight / 2 + dy;
-
-  return { x, y };
+  return { x: view.pixelWidth / 2 + dx, y: view.pixelHeight / 2 + dy };
 }
 
 function computePositions({ coords, view, tileSize }) {
@@ -545,9 +511,7 @@ function countryFromPlaceName(placeName) {
 function portLabelText(resolvedPort) {
   const portQuery = resolvedPort?.portQuery || "";
   const placeName = resolvedPort?.placeName || "";
-
   if (portQuery.includes(",")) return portQuery;
-
   const country = countryFromPlaceName(placeName);
   return country ? `${portQuery}, ${country}` : portQuery;
 }
@@ -568,20 +532,16 @@ function labelAnchor({ x, y, view, labelW, labelH, prefer = "ur" }) {
     [dl, dr, ul, ur];
 
   const c = order[0];
-  const left = Math.max(pad, Math.min(c.left, view.pixelWidth - labelW - pad));
-  const top = Math.max(pad, Math.min(c.top, view.pixelHeight - labelH - pad));
-  return { left, top };
+  return {
+    left: Math.max(pad, Math.min(c.left, view.pixelWidth - labelW - pad)),
+    top: Math.max(pad, Math.min(c.top, view.pixelHeight - labelH - pad))
+  };
 }
 
-function makeStopNumbers(count, isRoundTrip) {
-  // Correct rules:
-  // - index 0 is embark (no number)
-  // - last index is disembark (no number)
-  // - middle ports get 1..K
-  // Works for round trip too (last stop still unnumbered)
+// Only number ports-of-call (middle stops). Start/end get no number.
+function makeStopNumbers(count) {
   const nums = new Array(count).fill("");
   if (count <= 2) return nums;
-
   let n = 1;
   for (let i = 1; i <= count - 2; i++) {
     nums[i] = String(n);
@@ -590,178 +550,120 @@ function makeStopNumbers(count, isRoundTrip) {
   return nums;
 }
 
-function nearlySameCoord(a, b) {
-  // ~2km tolerance
-  const dlng = Math.abs(a[0] - b[0]);
-  const dlat = Math.abs(a[1] - b[1]);
-  return dlng < 0.03 && dlat < 0.03;
-}
-
-function arrowOverlaySvg({ cx, cy, angleDeg, size = 22, opacity = 0.35, colorHex = SLATE }) {
-  // A minimal chevron-style arrow (two strokes) feels “artsy” without shouting
+// BIGGER, DARKER chevrons so we can’t “miss” them.
+function chevronSvg({ angleDeg, size = 30, opacity = 0.55, colorHex = SLATE }) {
   const w = size * 2;
   const h = size * 2;
-  const x0 = size;
-  const y0 = size;
+  const cx = size;
+  const cy = size;
 
-  // Chevron points in local coords pointing RIGHT
-  const len = size * 0.9;
-  const wing = size * 0.35;
+  const len = size * 0.95;
+  const wing = size * 0.40;
 
-  const x1 = x0 - len * 0.45;
-  const x2 = x0 + len * 0.45;
-  const yUp = y0 - wing;
-  const yDn = y0 + wing;
+  const x1 = cx - len * 0.45;
+  const x2 = cx + len * 0.45;
+  const yUp = cy - wing;
+  const yDn = cy + wing;
 
-  return {
-    input: Buffer.from(`
-      <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
-        <g transform="rotate(${angleDeg.toFixed(2)} ${x0} ${y0})">
-          <line x1="${x1}" y1="${yUp}" x2="${x2}" y2="${y0}"
-            stroke="#${colorHex}" stroke-opacity="${opacity}" stroke-width="4" stroke-linecap="round"/>
-          <line x1="${x1}" y1="${yDn}" x2="${x2}" y2="${y0}"
-            stroke="#${colorHex}" stroke-opacity="${opacity}" stroke-width="4" stroke-linecap="round"/>
-        </g>
-      </svg>
-    `.trim()),
-    left: Math.round(cx - size),
-    top: Math.round(cy - size)
-  };
+  return Buffer.from(`
+    <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
+      <g transform="rotate(${angleDeg.toFixed(2)} ${cx} ${cy})">
+        <line x1="${x1}" y1="${yUp}" x2="${x2}" y2="${cy}"
+          stroke="#${colorHex}" stroke-opacity="${opacity}" stroke-width="5" stroke-linecap="round"/>
+        <line x1="${x1}" y1="${yDn}" x2="${x2}" y2="${cy}"
+          stroke="#${colorHex}" stroke-opacity="${opacity}" stroke-width="5" stroke-linecap="round"/>
+      </g>
+    </svg>
+  `.trim());
 }
 
-async function addArtsyDotsNumbersLabelsArrows({ pngBuffer, coords, resolvedPorts, view }) {
-  const cleaned = cleanCoordinates(coords);
-  if (cleaned.length < 1) {
-    return { buffer: pngBuffer, debug: { drawnDots: 0, drawnLabels: 0, drawnTags: 0, drawnArrows: 0 } };
-  }
-
+async function addDotsLabelsChevrons({ pngBuffer, displayCoords, routeCoordsForArrows, resolvedPorts, view, isRoundTrip }) {
   const meta = await sharp(pngBuffer).metadata();
   const actualW = meta?.width || view.requestedPixelWidth;
   const actualH = meta?.height || view.requestedPixelHeight;
 
   const actualView = { ...view, pixelWidth: actualW, pixelHeight: actualH };
 
-  const pos512 = computePositions({ coords: cleaned, view: actualView, tileSize: 512 });
-  const pos256 = computePositions({ coords: cleaned, view: actualView, tileSize: 256 });
+  const pos512 = computePositions({ coords: displayCoords, view: actualView, tileSize: 512 });
+  const pos256 = computePositions({ coords: displayCoords, view: actualView, tileSize: 256 });
 
   const in512 = countInBounds(pos512, actualView);
   const in256 = countInBounds(pos256, actualView);
-
   const tileSizeChosen = in256 > in512 ? 256 : 512;
   const positions = tileSizeChosen === 256 ? pos256 : pos512;
 
-  const isRoundTrip =
-    (resolvedPorts?.[0]?.portQuery && resolvedPorts?.[resolvedPorts.length - 1]?.portQuery &&
-      resolvedPorts[0].portQuery === resolvedPorts[resolvedPorts.length - 1].portQuery) ||
-    nearlySameCoord(cleaned[0], cleaned[cleaned.length - 1]);
+  // For arrows, use the displayed stop order (no duplicate end stop)
+  const arrowPos512 = computePositions({ coords: routeCoordsForArrows, view: actualView, tileSize: 512 });
+  const arrowPos256 = computePositions({ coords: routeCoordsForArrows, view: actualView, tileSize: 256 });
+  const arrowPositions = tileSizeChosen === 256 ? arrowPos256 : arrowPos512;
 
-  // Visual system (scaled for @2x)
-  const haloR = 20;
-  const dotR = 13;
-
-  // Numbers inside dot (only ports of call)
-  const numFontSize = 18;
   const fontFamily = "Arial, Helvetica, sans-serif";
 
-  // Label style: smaller + softer + more “blended”
-  const labelFontSize = 20;
-  const labelWeight = 600;
-  const labelOpacity = 0.78;
-  const labelStrokeOpacity = 0.80;
-  const labelStrokeWidth = 4;
+  const haloR = 20;
+  const dotR = 13;
+  const numFontSize = 18;
 
-  // Tiny tags
-  const tagFontSize = 16;
-  const tagPadX = 10;
-  const tagPadY = 6;
-  const tagRadius = 10;
-  const tagFillOpacity = 0.70;
-  const tagTextOpacity = 0.78;
+  const labelFontSize = 20;
+  const labelOpacity = 0.78;
 
   const overlays = [];
 
-  // Label strings
-  const labels = (resolvedPorts || []).map(portLabelText);
-
-  // Stop numbers (corrected)
-  const stopNums = makeStopNumbers(positions.length, isRoundTrip);
-
-  // 0) Direction arrows (behind labels + dots)
-  let drawnArrows = 0;
-  for (let i = 0; i < positions.length - 1; i++) {
-    const a = positions[i];
-    const b = positions[i + 1];
+  // --- CHEVRONS (do these FIRST, behind text/dots) ---
+  let drawnChevrons = 0;
+  for (let i = 0; i < arrowPositions.length - 1; i++) {
+    const a = arrowPositions[i];
+    const b = arrowPositions[i + 1];
 
     const dx = b.x - a.x;
     const dy = b.y - a.y;
     const dist = Math.sqrt(dx*dx + dy*dy);
-
-    if (!Number.isFinite(dist) || dist < 40) continue;
-
-    // Place arrow at ~60% along the leg (keeps it away from dot/label congestion)
-    const t = 0.60;
-    const cx = a.x + dx * t;
-    const cy = a.y + dy * t;
+    if (!Number.isFinite(dist) || dist < 60) continue;
 
     const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
 
-    overlays.push(arrowOverlaySvg({
-      cx,
-      cy,
-      angleDeg,
-      size: 20,
-      opacity: 0.28,          // subtle
-      colorHex: SLATE
-    }));
+    // Two chevrons per leg if the leg is long enough
+    const placements = dist > 380 ? [0.45, 0.70] : [0.60];
 
-    drawnArrows++;
+    for (const t of placements) {
+      const cx = a.x + dx * t;
+      const cy = a.y + dy * t;
+
+      overlays.push({
+        input: chevronSvg({ angleDeg, size: 30, opacity: 0.55, colorHex: SLATE }),
+        left: Math.round(cx - 30),
+        top: Math.round(cy - 30)
+      });
+      drawnChevrons++;
+    }
   }
 
-  // 1) Labels (text + faint leader line)
+  // --- LABELS ---
   let drawnLabels = 0;
+  const labels = (resolvedPorts || []).map(portLabelText);
+
   for (let i = 0; i < positions.length; i++) {
     const p = positions[i];
     const label = labels[i] || "";
     if (!label) continue;
 
-    const approxW = Math.min(Math.max(220, Math.round(label.length * labelFontSize * 0.55)), 980);
-    const labelW = approxW;
+    const labelW = Math.min(Math.max(220, Math.round(label.length * labelFontSize * 0.55)), 980);
     const labelH = Math.round(labelFontSize * 1.35);
-
     const prefer = i % 2 === 0 ? "ur" : "ul";
     const anchor = labelAnchor({ x: p.x, y: p.y, view: actualView, labelW, labelH, prefer });
-
-    // faint leader line
-    const lineX1 = Math.round(p.x);
-    const lineY1 = Math.round(p.y);
-    const lineX2 = Math.round(anchor.left + 6);
-    const lineY2 = Math.round(anchor.top + Math.round(labelH * 0.78));
-
-    overlays.push({
-      input: Buffer.from(`
-        <svg width="${actualView.pixelWidth}" height="${actualView.pixelHeight}" xmlns="http://www.w3.org/2000/svg">
-          <line x1="${lineX1}" y1="${lineY1}" x2="${lineX2}" y2="${lineY2}"
-            stroke="#${SLATE}" stroke-opacity="0.20" stroke-width="3" stroke-linecap="round"/>
-          <circle cx="${lineX2}" cy="${lineY2}" r="3.5" fill="#${SLATE}" fill-opacity="0.18"/>
-        </svg>
-      `.trim()),
-      left: 0,
-      top: 0
-    });
 
     overlays.push({
       input: Buffer.from(`
         <svg width="${labelW}" height="${labelH}" xmlns="http://www.w3.org/2000/svg">
           <text x="0" y="${Math.round(labelH * 0.86)}"
             font-family="${fontFamily}"
-            font-weight="${labelWeight}"
+            font-weight="600"
             font-size="${labelFontSize}"
             fill="#${SLATE}"
             fill-opacity="${labelOpacity}"
             paint-order="stroke"
             stroke="white"
-            stroke-width="${labelStrokeWidth}"
-            stroke-opacity="${labelStrokeOpacity}"
+            stroke-width="4"
+            stroke-opacity="0.82"
             stroke-linejoin="round">${escapeXml(label)}</text>
         </svg>
       `.trim()),
@@ -772,51 +674,13 @@ async function addArtsyDotsNumbersLabelsArrows({ pngBuffer, coords, resolvedPort
     drawnLabels++;
   }
 
-  // 2) Tags: START/END unless round trip (then one tag only)
-  let drawnTags = 0;
-  if (positions.length >= 1) {
-    const first = positions[0];
-    const last = positions[positions.length - 1];
-
-    const makeTag = (text, x, y, prefer) => {
-      const w = Math.round(text.length * tagFontSize * 0.62 + tagPadX * 2);
-      const h = Math.round(tagFontSize + tagPadY * 2);
-      const pos = labelAnchor({ x, y, view: actualView, labelW: w, labelH: h, prefer });
-
-      overlays.push({
-        input: Buffer.from(`
-          <svg width="${w}" height="${h}" xmlns="http://www.w3.org/2000/svg">
-            <rect x="0" y="0" width="${w}" height="${h}" rx="${tagRadius}" ry="${tagRadius}"
-              fill="white" fill-opacity="${tagFillOpacity}"/>
-            <text x="${tagPadX}" y="${Math.round(h / 2 + tagFontSize * 0.35)}"
-              font-family="${fontFamily}" font-weight="800"
-              font-size="${tagFontSize}"
-              fill="#${SLATE}" fill-opacity="${tagTextOpacity}"
-              letter-spacing="0.6">${escapeXml(text)}</text>
-          </svg>
-        `.trim()),
-        left: pos.left,
-        top: pos.top
-      });
-
-      drawnTags++;
-    };
-
-    if (isRoundTrip) {
-      makeTag("DEPART/RETURN", first.x, first.y, "dr");
-    } else {
-      makeTag("START", first.x, first.y, "dr");
-      makeTag("END", last.x, last.y, "dl");
-    }
-  }
-
-  // 3) Dots + stop numbers on top
+  // --- DOTS + STOP NUMBERS (ports-of-call only) ---
   let drawnDots = 0;
+  const stopNums = makeStopNumbers(positions.length);
+
   for (let i = 0; i < positions.length; i++) {
     const p = positions[i];
-    if (p.x < -60 || p.y < -60 || p.x > actualView.pixelWidth + 60 || p.y > actualView.pixelHeight + 60) continue;
-
-    const num = stopNums[i]; // "" for start/end
+    const num = stopNums[i];
     const showNum = Boolean(num);
 
     overlays.push({
@@ -824,16 +688,14 @@ async function addArtsyDotsNumbersLabelsArrows({ pngBuffer, coords, resolvedPort
         <svg width="${haloR * 2}" height="${haloR * 2}" xmlns="http://www.w3.org/2000/svg">
           <circle cx="${haloR}" cy="${haloR}" r="${haloR}" fill="white" fill-opacity="0.70"/>
           <circle cx="${haloR}" cy="${haloR}" r="${dotR}" fill="#${SLATE}" fill-opacity="0.92"/>
-          ${
-            showNum
-              ? `<text x="${haloR}" y="${haloR + Math.round(numFontSize * 0.35)}"
-                  text-anchor="middle"
-                  font-family="${fontFamily}"
-                  font-weight="900"
-                  font-size="${numFontSize}"
-                  fill="#ffffff" fill-opacity="0.95">${escapeXml(num)}</text>`
-              : ``
-          }
+          ${showNum ? `
+            <text x="${haloR}" y="${haloR + Math.round(numFontSize * 0.35)}"
+              text-anchor="middle"
+              font-family="${fontFamily}"
+              font-weight="900"
+              font-size="${numFontSize}"
+              fill="#ffffff" fill-opacity="0.95">${escapeXml(num)}</text>
+          ` : ``}
         </svg>
       `.trim()),
       left: Math.round(p.x - haloR),
@@ -849,16 +711,11 @@ async function addArtsyDotsNumbersLabelsArrows({ pngBuffer, coords, resolvedPort
     buffer: out,
     debug: {
       isRoundTrip,
-      drawnDots,
-      drawnLabels,
-      drawnTags,
-      drawnArrows,
       tileSizeChosen,
-      inBounds512: in512,
-      inBounds256: in256,
-      requested: { w: view.requestedPixelWidth, h: view.requestedPixelHeight, pixelRatio: view.pixelRatio },
-      actual: { w: actualW, h: actualH },
-      sample: positions.slice(0, 3).map((p) => ({ x: Math.round(p.x), y: Math.round(p.y) }))
+      drawnChevrons,
+      drawnLabels,
+      drawnDots,
+      displayStopCount: positions.length
     }
   };
 }
@@ -911,15 +768,11 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
     }
   `;
 
-  const stagedInput = [
-    { resource: "FILE", filename, mimeType: "image/png", httpMethod: "POST" }
-  ];
+  const stagedInput = [{ resource: "FILE", filename, mimeType: "image/png", httpMethod: "POST" }];
 
   const stagedData = await shopifyGraphQL(stagedQuery, { input: stagedInput });
   const staged = stagedData?.stagedUploadsCreate;
-  if (staged?.userErrors?.length) {
-    throw new Error(`stagedUploadsCreate userErrors: ${JSON.stringify(staged.userErrors)}`);
-  }
+  if (staged?.userErrors?.length) throw new Error(`stagedUploadsCreate userErrors: ${JSON.stringify(staged.userErrors)}`);
 
   const target = staged?.stagedTargets?.[0];
   if (!target?.url || !target?.resourceUrl || !Array.isArray(target.parameters)) {
@@ -951,9 +804,7 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
 
   const fileCreateData = await shopifyGraphQL(fileCreateQuery, fileCreateVars);
   const fc = fileCreateData?.fileCreate;
-  if (fc?.userErrors?.length) {
-    throw new Error(`fileCreate userErrors: ${JSON.stringify(fc.userErrors)}`);
-  }
+  if (fc?.userErrors?.length) throw new Error(`fileCreate userErrors: ${JSON.stringify(fc.userErrors)}`);
 
   const file = fc?.files?.[0];
   const fileId = file?.id || null;
@@ -968,7 +819,6 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
         }
       }
     `;
-
     for (let i = 0; i < 8; i++) {
       await new Promise((r) => setTimeout(r, 800));
       const data = await shopifyGraphQL(fileQuery, { id: fileId });
@@ -1000,9 +850,7 @@ async function addMapLinkToOrderNote({ orderId, mapUrl }) {
     }
   `;
 
-  const noteBlock =
-`Port to Port — Map Generated
-Download: ${mapUrl}`;
+  const noteBlock = `Port to Port — Map Generated\nDownload: ${mapUrl}`;
 
   const data = await shopifyGraphQL(query, { input: { id: gid, note: noteBlock } });
   const ue = data?.orderUpdate?.userErrors || [];
@@ -1024,15 +872,13 @@ async function setOrderMetafieldMapUrl({ orderId, mapUrl }) {
   `;
 
   const vars = {
-    metafields: [
-      {
-        ownerId: gid,
-        namespace: "port_to_port",
-        key: "map_url",
-        type: "single_line_text_field",
-        value: String(mapUrl || "")
-      }
-    ]
+    metafields: [{
+      ownerId: gid,
+      namespace: "port_to_port",
+      key: "map_url",
+      type: "single_line_text_field",
+      value: String(mapUrl || "")
+    }]
   };
 
   const data = await shopifyGraphQL(query, vars);
@@ -1070,7 +916,6 @@ async function sendEmailViaResend({ to, subject, html, text }) {
 async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   const token = process.env.APIFY_TOKEN;
   const taskId = process.env.APIFY_TASK_ID;
-
   if (!token || !taskId) throw new Error("Missing APIFY_TOKEN or APIFY_TASK_ID in Render environment variables.");
 
   const input = {
@@ -1162,19 +1007,19 @@ app.post("/webhooks/order-paid", async (req, res) => {
   let chosenMeta = null;
 
   let cleanedPortQueries = [];
-  let resolved = [];
+  let resolvedAll = [];
+  let resolvedDisplay = [];
 
   let previewBaseUrl = null;
   let finalBaseUrl = null;
 
   let renderDebug = null;
 
-  let shopifyFileId = null;
   let shopifyFileUrl = null;
-  let shopifyFileStatus = null;
 
   let orderNoteWritten = false;
   let metafieldWritten = false;
+
   let emailSent = false;
   let emailResult = null;
 
@@ -1191,38 +1036,81 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     cleanedPortQueries = finalPorts.map(normalizePortText);
 
-    resolved = [];
-    for (const q of cleanedPortQueries) resolved.push(await resolvePort(q));
+    // Resolve ALL stops
+    resolvedAll = [];
+    for (const q of cleanedPortQueries) resolvedAll.push(await resolvePort(q));
 
-    const coords = resolved.map((r) => r.coordinates);
+    // Determine round trip
+    const coordsAll = resolvedAll.map((r) => r.coordinates);
+    const isRoundTrip =
+      (resolvedAll[0]?.portQuery && resolvedAll[resolvedAll.length - 1]?.portQuery &&
+        resolvedAll[0].portQuery === resolvedAll[resolvedAll.length - 1].portQuery) ||
+      (coordsAll.length >= 2 && nearlySameCoord(coordsAll[0], coordsAll[coordsAll.length - 1]));
 
-    // seed key ensures route jitter is stable per itinerary
+    // DISPLAY stops: remove duplicated final stop if round trip
+    resolvedDisplay = resolvedAll.slice();
+    if (isRoundTrip && resolvedDisplay.length >= 2) {
+      const last = resolvedDisplay[resolvedDisplay.length - 1];
+      const first = resolvedDisplay[0];
+      if (last.portQuery === first.portQuery || nearlySameCoord(last.coordinates, first.coordinates)) {
+        resolvedDisplay = resolvedDisplay.slice(0, -1);
+      }
+    }
+
+    const displayCoords = resolvedDisplay.map((r) => r.coordinates);
+
+    // ROUTE coords: if round trip, we close the loop by adding first coordinate at end
+    const routeCoords = (() => {
+      const base = displayCoords.slice();
+      if (isRoundTrip && base.length >= 2) base.push(base[0]);
+      return base;
+    })();
+
+    // seed key ensures deterministic “artsy” jitter per itinerary
     const seedKey = `${shipName || ""}|${sailDate || ""}|${cleanedPortQueries.join(" > ")}`;
 
-    const preview = buildBaseMapUrl({ coords, width: 1200, height: 800, retina: false, seedKey });
+    // Build map urls
+    const preview = buildBaseMapUrl({
+      displayCoords,
+      routeCoords,
+      width: 1200,
+      height: 800,
+      retina: false,
+      seedKey
+    });
     previewBaseUrl = preview.url;
 
-    const final = buildBaseMapUrl({ coords, width: 1280, height: 853, retina: true, seedKey });
+    const final = buildBaseMapUrl({
+      displayCoords,
+      routeCoords,
+      width: 1280,
+      height: 853,
+      retina: true,
+      seedKey
+    });
     finalBaseUrl = final.url;
 
     const basePng = await downloadImageToBuffer(final.url);
 
-    const rendered = await addArtsyDotsNumbersLabelsArrows({
+    // Chevrons should show for both round-trip and one-way
+    const rendered = await addDotsLabelsChevrons({
       pngBuffer: basePng,
-      coords,
-      resolvedPorts: resolved,
-      view: final.view
+      displayCoords,
+      routeCoordsForArrows: routeCoords,
+      resolvedPorts: resolvedDisplay,
+      view: final.view,
+      isRoundTrip
     });
     renderDebug = rendered.debug;
 
+    // Ensure filename changes EVERY time (prevents Shopify file caching confusion)
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
     const safeDate = (sailDate || "date").replace(/[^0-9-]+/g, "");
-    const filename = `cruise-map-${safeShip}-${safeDate}.png`;
+    const uniq = Date.now();
+    const filename = `cruise-map-${safeShip}-${safeDate}-${uniq}.png`;
 
     const uploaded = await uploadPngToShopifyFiles({ buffer: rendered.buffer, filename });
-    shopifyFileId = uploaded.fileId;
     shopifyFileUrl = uploaded.url;
-    shopifyFileStatus = uploaded.status;
 
     if (shopifyFileUrl && body.id) {
       await addMapLinkToOrderNote({ orderId: body.id, mapUrl: shopifyFileUrl });
@@ -1235,32 +1123,21 @@ app.post("/webhooks/order-paid", async (req, res) => {
     const customerEmail = body.email || body?.customer?.email || null;
     if (shopifyFileUrl && customerEmail) {
       const subject = `Your Cruise Route Map (${shipName || "Port to Port"})`;
-      const text =
-`Hi!
+      const text = `Hi!\n\nYour Port to Port cruise route map is ready.\n\nDownload here:\n${shopifyFileUrl}\n\n— Port to Port`;
 
-Your Port to Port cruise route map is ready.
-
-Download here:
-${shopifyFileUrl}
-
-— Port to Port`;
-
-      const html =
-`<div style="font-family: Arial, sans-serif; line-height: 1.5;">
-  <p>Hi!</p>
-  <p>Your <strong>Port to Port</strong> cruise route map is ready.</p>
-  <p><a href="${shopifyFileUrl}">Download your map</a></p>
-  <p>— Port to Port</p>
-</div>`;
+      const html = `
+        <div style="font-family: Arial, sans-serif; line-height: 1.5;">
+          <p>Hi!</p>
+          <p>Your <strong>Port to Port</strong> cruise route map is ready.</p>
+          <p><a href="${shopifyFileUrl}">Download your map</a></p>
+          <p>— Port to Port</p>
+        </div>
+      `.trim();
 
       emailResult = await sendEmailViaResend({ to: customerEmail, subject, html, text });
       emailSent = Boolean(emailResult?.sent);
     } else {
-      emailResult = {
-        sent: false,
-        skipped: true,
-        reason: !shopifyFileUrl ? "No shopifyFileUrl" : "No customer email on order payload"
-      };
+      emailResult = { sent: false, skipped: true, reason: !shopifyFileUrl ? "No shopifyFileUrl" : "No customer email" };
     }
 
     const entry = {
@@ -1268,18 +1145,13 @@ ${shopifyFileUrl}
       inputs: { cruiseLine, shipName, sailDate, portsChanged },
       ports: { source: portsSource, list: finalPorts, chosenMeta },
       map: {
+        isRoundTrip,
         cleanedPortQueries,
-        resolvedPorts: resolved.map((r) => ({
-          portQuery: r.portQuery,
-          placeName: r.placeName,
-          coordinates: r.coordinates,
-          pinned: Boolean(PINNED_PORT_COORDS[r.portQuery])
-        })),
+        displayStops: resolvedDisplay.map((r) => r.portQuery),
+        routeStops: routeCoords,
         previewBaseUrl,
         finalBaseUrl,
         render: renderDebug,
-        shopifyFileId,
-        shopifyFileStatus,
         shopifyFileUrl
       },
       delivery: { wroteOrderNote: orderNoteWritten, wroteMetafield: metafieldWritten, emailSent, emailResult }
@@ -1293,7 +1165,7 @@ ${shopifyFileUrl}
     recentWebhookHits.unshift({
       at: new Date().toISOString(),
       error: String(err?.message || err),
-      map: { previewBaseUrl, finalBaseUrl, render: renderDebug, shopifyFileId, shopifyFileStatus, shopifyFileUrl }
+      map: { previewBaseUrl, finalBaseUrl, render: renderDebug, shopifyFileUrl }
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
@@ -1301,6 +1173,4 @@ ${shopifyFileUrl}
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
