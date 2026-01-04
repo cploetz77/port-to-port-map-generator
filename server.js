@@ -14,14 +14,12 @@ app.use(express.json({ limit: "4mb" }));
 
 app.get("/", (req, res) => res.send("Savvy Cruiser Map Generator is running"));
 
-
-
 app.get("/debug/webhooks", (req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.send(JSON.stringify(recentWebhookHits, null, 2));
 });
 
-/* --------------------- SHOPIFY LINE ITEM PROPERTY PARSING --------------------- */
+/* -------------------- SHOPIFY LINE ITEM PROPERTY PARSING -------------------- */
 
 function extractLineItemProperties(lineItem) {
   const props = [];
@@ -335,41 +333,7 @@ function jitterRoute(routeCoords, seedKey, amplitudeKm = 9) {
   return out;
 }
 
-/* -------------------- MAPBOX STATIC IMAGE URL BUILD -------------------- */
-
-function encodePolylineLngLat(coords) {
-  function encodeSigned(num) {
-    let sgnNum = num << 1;
-    if (num < 0) sgnNum = ~sgnNum;
-    let encoded = "";
-    while (sgnNum >= 0x20) {
-      encoded += String.fromCharCode((0x20 | (sgnNum & 0x1f)) + 63);
-      sgnNum >>= 5;
-    }
-    encoded += String.fromCharCode(sgnNum + 63);
-    return encoded;
-  }
-
-  let lastLat = 0;
-  let lastLng = 0;
-  let result = "";
-
-  for (const [lng, lat] of coords) {
-    const latE5 = Math.round(lat * 1e5);
-    const lngE5 = Math.round(lng * 1e5);
-
-    const dLat = latE5 - lastLat;
-    const dLng = lngE5 - lastLng;
-
-    lastLat = latE5;
-    lastLng = lngE5;
-
-    result += encodeSigned(dLat);
-    result += encodeSigned(dLng);
-  }
-
-  return result;
-}
+/* -------------------- MAP PROJECTION + VIEW -------------------- */
 
 function lngLatToWorld(lng, lat) {
   const x = (lng + 180) / 360;
@@ -414,54 +378,6 @@ function computeCenterZoom(coords, width, height, padding = 140) {
   return { centerLng, centerLat, zoom: Number(zoom.toFixed(2)) };
 }
 
-const MAPBOX_STYLE_ID = "mapbox/light-v11";
-const ROUTE_TEAL = "0aa6a6";
-const SLATE = "2f3b45";
-
-function buildBaseMapUrl({ displayCoords, routeCoords, width = 1200, height = 800, retina = false, seedKey = "" }) {
-  const token = process.env.MAPBOX_TOKEN;
-  if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
-  if (width < 1 || width > 1280) throw new Error("Width must be between 1-1280.");
-  if (height < 1 || height > 1280) throw new Error("Height must be between 1-1280.");
-
-  const fitCoords = cleanCoordinates(displayCoords);
-  const drawCoords = cleanCoordinates(routeCoords);
-
-  if (fitCoords.length < 2) throw new Error("Not enough valid coordinates to fit map.");
-  if (drawCoords.length < 2) throw new Error("Not enough valid coordinates to draw route.");
-
-  const dense = densifyRoute(drawCoords, 18);
-  const jittered = jitterRoute(dense, seedKey || JSON.stringify(drawCoords), 9);
-
-  const polyDense = encodeURIComponent(encodePolylineLngLat(dense));
-  const polyJitter = encodeURIComponent(encodePolylineLngLat(jittered));
-
-  // More obvious “artsy” layering
-  const wash = `path-20+${ROUTE_TEAL}-0.12(${polyJitter})`;
-  const halo = `path-12+${SLATE}-0.14(${polyDense})`;
-  const main = `path-6+${ROUTE_TEAL}-0.84(${polyDense})`;
-  const sketch = `path-4+${ROUTE_TEAL}-0.55(${polyJitter})`;
-
-  const { centerLng, centerLat, zoom } = computeCenterZoom(fitCoords, width, height, 155);
-
-  const overlay = `${wash},${halo},${main},${sketch}`;
-  const sizePart = retina ? `${width}x${height}@2x` : `${width}x${height}`;
-
-  const url = `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${overlay}/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
-
-  const pixelRatio = retina ? 2 : 1;
-  return {
-    url,
-    view: {
-      centerLng, centerLat, zoom, pixelRatio,
-      requestedPixelWidth: width * pixelRatio,
-      requestedPixelHeight: height * pixelRatio
-    }
-  };
-}
-
-/* -------------------- LABELS + CHEVRONS (SHARP COMPOSITE) -------------------- */
-
 function lngLatToPixel({ lng, lat, view, tileSize }) {
   const scale = tileSize * Math.pow(2, view.zoom) * (view.pixelRatio || 1);
 
@@ -492,6 +408,42 @@ function countInBounds(positions, view) {
   }
   return n;
 }
+
+/* -------------------- MAPBOX BASE MAP URL (NO ROUTE OVERLAY) -------------------- */
+
+const MAPBOX_STYLE_ID = "mapbox/light-v11";
+const ROUTE_TEAL = "0aa6a6";
+const SLATE = "2f3b45";
+
+function buildBaseOnlyMapUrl({ fitCoords, width = 1200, height = 800, retina = false }) {
+  const token = process.env.MAPBOX_TOKEN;
+  if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
+  if (width < 1 || width > 1280) throw new Error("Width must be between 1-1280.");
+  if (height < 1 || height > 1280) throw new Error("Height must be between 1-1280.");
+
+  const fit = cleanCoordinates(fitCoords);
+  if (fit.length < 2) throw new Error("Not enough valid coordinates to fit map.");
+
+  const { centerLng, centerLat, zoom } = computeCenterZoom(fit, width, height, 155);
+
+  const sizePart = retina ? `${width}x${height}@2x` : `${width}x${height}`;
+  const url = `https://api.mapbox.com/styles/v1/${MAPBOX_STYLE_ID}/static/${centerLng},${centerLat},${zoom}/${sizePart}?access_token=${token}`;
+
+  const pixelRatio = retina ? 2 : 1;
+  return {
+    url,
+    view: {
+      centerLng,
+      centerLat,
+      zoom,
+      pixelRatio,
+      requestedPixelWidth: width * pixelRatio,
+      requestedPixelHeight: height * pixelRatio
+    }
+  };
+}
+
+/* -------------------- ART LAYERS: ROUTE MASKED BY WATER + WHITE CHEVRONS + LABELS/DOTS -------------------- */
 
 function escapeXml(s) {
   return String(s)
@@ -540,7 +492,82 @@ function labelAnchor({ x, y, view, labelW, labelH, prefer = "ur" }) {
   };
 }
 
-// Only number ports-of-call (middle stops). Start/end get no number.
+/* --------- Label collision avoidance helpers --------- */
+
+function approxTextWidthPx(text, fontSize) {
+  return Math.round(Math.max(80, Math.min(980, text.length * fontSize * 0.55)));
+}
+
+function labelCandidates({ x, y, view, w, h }) {
+  const pad = 14;
+  const gap = 18;
+
+  const candidates = [
+    { left: Math.round(x + gap), top: Math.round(y - gap - h) },        // UR
+    { left: Math.round(x - gap - w), top: Math.round(y - gap - h) },    // UL
+    { left: Math.round(x + gap), top: Math.round(y + gap) },            // DR
+    { left: Math.round(x - gap - w), top: Math.round(y + gap) },        // DL
+    { left: Math.round(x + gap), top: Math.round(y - h / 2) },          // R
+    { left: Math.round(x - gap - w), top: Math.round(y - h / 2) },      // L
+    { left: Math.round(x - w / 2), top: Math.round(y + gap) },          // D
+    { left: Math.round(x - w / 2), top: Math.round(y - gap - h) },      // U
+  ];
+
+  return candidates.map((c) => ({
+    left: Math.max(pad, Math.min(c.left, view.pixelWidth - w - pad)),
+    top: Math.max(pad, Math.min(c.top, view.pixelHeight - h - pad)),
+  }));
+}
+
+function rectsOverlap(a, b, pad = 6) {
+  return !(
+    a.left + a.w + pad < b.left ||
+    b.left + b.w + pad < a.left ||
+    a.top + a.h + pad < b.top ||
+    b.top + b.h + pad < a.top
+  );
+}
+
+function placeLabelsNoOverlap({ points, labels, view, fontSize }) {
+  const placed = [];
+  const result = [];
+
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const text = labels[i] || "";
+    if (!text) {
+      result.push(null);
+      continue;
+    }
+
+    const w = approxTextWidthPx(text, fontSize);
+    const h = Math.round(fontSize * 1.35);
+
+    const candidates = labelCandidates({ x: p.x, y: p.y, view, w, h });
+
+    let chosen = null;
+    for (const c of candidates) {
+      const rect = { left: c.left, top: c.top, w, h };
+      const collides = placed.some((r) => rectsOverlap(rect, r, 10));
+      if (!collides) {
+        chosen = rect;
+        break;
+      }
+    }
+
+    if (!chosen) {
+      const fallback = labelAnchor({ x: p.x, y: p.y, view, labelW: w, labelH: h, prefer: "ur" });
+      chosen = { left: fallback.left, top: fallback.top, w, h };
+    }
+
+    placed.push(chosen);
+    result.push({ ...chosen, text });
+  }
+
+  return result;
+}
+
+/* --------- Stop numbering: only ports-of-call (middle stops) --------- */
 function makeStopNumbers(count) {
   const nums = new Array(count).fill("");
   if (count <= 2) return nums;
@@ -552,8 +579,8 @@ function makeStopNumbers(count) {
   return nums;
 }
 
-// BIGGER, DARKER chevrons so we can’t “miss” them.
-function chevronSvg({ angleDeg, size = 30, opacity = 0.55, colorHex = SLATE }) {
+/* --------- White chevrons --------- */
+function chevronSvg({ angleDeg, size = 30, opacity = 0.70, colorHex = "ffffff" }) {
   const w = size * 2;
   const h = size * 2;
   const cx = size;
@@ -579,38 +606,172 @@ function chevronSvg({ angleDeg, size = 30, opacity = 0.55, colorHex = SLATE }) {
   `.trim());
 }
 
-async function addDotsLabelsChevrons({ pngBuffer, displayCoords, routeCoordsForArrows, resolvedPorts, view, isRoundTrip }) {
+/* --------- Artsy route SVGs (wash + main) --------- */
+function routeSvgsFromPixelPoints({ width, height, points, seedKey }) {
+  const seed = hashString(seedKey || JSON.stringify(points.slice(0, 10)));
+  const rnd = makeRng(seed);
+
+  const jittered = points.map((p, idx) => {
+    if (idx === 0 || idx === points.length - 1) return p;
+    const j = (rnd() - 0.5) * 2;
+    const k = (rnd() - 0.5) * 2;
+    return { x: p.x + j * 2.0, y: p.y + k * 2.0 };
+  });
+
+  const toPts = (arr) => arr.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+
+  const ptsMain = toPts(points);
+  const ptsSketch = toPts(jittered);
+
+  const washSvg = Buffer.from(`
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <polyline points="${ptsSketch}" fill="none"
+        stroke="#${ROUTE_TEAL}" stroke-opacity="0.14" stroke-width="26"
+        stroke-linecap="round" stroke-linejoin="round"/>
+      <polyline points="${ptsSketch}" fill="none"
+        stroke="#${ROUTE_TEAL}" stroke-opacity="0.08" stroke-width="40"
+        stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  `.trim());
+
+  const mainSvg = Buffer.from(`
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      <polyline points="${ptsMain}" fill="none"
+        stroke="#${SLATE}" stroke-opacity="0.18" stroke-width="12"
+        stroke-linecap="round" stroke-linejoin="round"/>
+      <polyline points="${ptsMain}" fill="none"
+        stroke="#${ROUTE_TEAL}" stroke-opacity="0.88" stroke-width="6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+      <polyline points="${ptsSketch}" fill="none"
+        stroke="#${ROUTE_TEAL}" stroke-opacity="0.55" stroke-width="3.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+  `.trim());
+
+  return { washSvg, mainSvg };
+}
+
+// Heuristic "water" detector for Mapbox light-v11.
+// Not perfect, but looks great in practice: lines disappear when they touch land.
+function buildWaterMaskFromBaseMapRGBA(rgba, width, height) {
+  const out = Buffer.alloc(width * height * 4, 0);
+
+  for (let i = 0; i < width * height; i++) {
+    const r = rgba[i * 4 + 0];
+    const g = rgba[i * 4 + 1];
+    const b = rgba[i * 4 + 2];
+
+    const y = (r * 0.2126 + g * 0.7152 + b * 0.0722);
+    const blueBias = (b - r) + (b - g);
+    const greenBias = (g - r);
+
+    const isWater =
+      (y > 120 && blueBias > 18) ||
+      (y > 150 && (b - r) > 10 && (b - g) > 6) ||
+      (y > 170 && blueBias > 8 && greenBias > 6);
+
+    const alpha = isWater ? 255 : 0;
+
+    out[i * 4 + 0] = 255;
+    out[i * 4 + 1] = 255;
+    out[i * 4 + 2] = 255;
+    out[i * 4 + 3] = alpha;
+  }
+
+  return out;
+}
+
+async function addRouteMaskedDotsLabelsChevrons({
+  pngBuffer,
+  displayCoords,
+  routeCoordsForArrows,
+  routeCoordsForLine,
+  resolvedPorts,
+  view,
+  isRoundTrip,
+  seedKey
+}) {
   const meta = await sharp(pngBuffer).metadata();
   const actualW = meta?.width || view.requestedPixelWidth;
   const actualH = meta?.height || view.requestedPixelHeight;
 
   const actualView = { ...view, pixelWidth: actualW, pixelHeight: actualH };
 
+  // Decide tile size projection (256 vs 512)
   const pos512 = computePositions({ coords: displayCoords, view: actualView, tileSize: 512 });
   const pos256 = computePositions({ coords: displayCoords, view: actualView, tileSize: 256 });
 
   const in512 = countInBounds(pos512, actualView);
   const in256 = countInBounds(pos256, actualView);
   const tileSizeChosen = in256 > in512 ? 256 : 512;
-  const positions = tileSizeChosen === 256 ? pos256 : pos512;
 
-  // For arrows, use the displayed stop order (no duplicate end stop)
+  const displayPositions = tileSizeChosen === 256 ? pos256 : pos512;
+
   const arrowPos512 = computePositions({ coords: routeCoordsForArrows, view: actualView, tileSize: 512 });
   const arrowPos256 = computePositions({ coords: routeCoordsForArrows, view: actualView, tileSize: 256 });
   const arrowPositions = tileSizeChosen === 256 ? arrowPos256 : arrowPos512;
 
-  const fontFamily = "Arial, Helvetica, sans-serif";
+  // ---- 1) Build water mask from the base map pixels ----
+  const { data: rgba } = await sharp(pngBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const waterMaskRGBA = buildWaterMaskFromBaseMapRGBA(rgba, actualW, actualH);
 
-  const haloR = 20;
-  const dotR = 13;
-  const numFontSize = 18;
+  const waterMaskPng = await sharp(waterMaskRGBA, {
+    raw: { width: actualW, height: actualH, channels: 4 }
+  }).png().toBuffer();
 
-  const labelFontSize = 20;
-  const labelOpacity = 0.78;
+  // ---- 2) Build artsy route layer (wash + main), then mask it to water ----
+  const dense = densifyRoute(routeCoordsForLine, 22);
+  const jittered = jitterRoute(dense, seedKey, 9);
 
+  const linePos512 = computePositions({ coords: jittered, view: actualView, tileSize: 512 });
+  const linePos256 = computePositions({ coords: jittered, view: actualView, tileSize: 256 });
+  const linePositions = tileSizeChosen === 256 ? linePos256 : linePos512;
+
+  const { washSvg, mainSvg } = routeSvgsFromPixelPoints({
+    width: actualW,
+    height: actualH,
+    points: linePositions.map((p) => ({ x: p.x, y: p.y })),
+    seedKey
+  });
+
+  const washLayer = await sharp({
+    create: { width: actualW, height: actualH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+  })
+    .composite([{ input: washSvg, left: 0, top: 0 }])
+    .png()
+    .toBuffer();
+
+  const washBlurred = await sharp(washLayer).blur(2.4).png().toBuffer();
+
+  const mainLayer = await sharp({
+    create: { width: actualW, height: actualH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+  })
+    .composite([{ input: mainSvg, left: 0, top: 0 }])
+    .png()
+    .toBuffer();
+
+  const routeLayer = await sharp({
+    create: { width: actualW, height: actualH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+  })
+    .composite([
+      { input: washBlurred, left: 0, top: 0 },
+      { input: mainLayer, left: 0, top: 0 }
+    ])
+    .png()
+    .toBuffer();
+
+  const routeMasked = await sharp(routeLayer)
+    .composite([{ input: waterMaskPng, left: 0, top: 0, blend: "dest-in" }])
+    .png()
+    .toBuffer();
+
+  // ---- 3) Composite: route (masked) + chevrons + labels + dots ----
   const overlays = [];
 
-  // --- CHEVRONS (do these FIRST, behind text/dots) ---
+  // Route masked goes first
+  overlays.push({ input: routeMasked, left: 0, top: 0 });
+
+  // Chevrons (white)
   let drawnChevrons = 0;
   for (let i = 0; i < arrowPositions.length - 1; i++) {
     const a = arrowPositions[i];
@@ -622,8 +783,6 @@ async function addDotsLabelsChevrons({ pngBuffer, displayCoords, routeCoordsForA
     if (!Number.isFinite(dist) || dist < 60) continue;
 
     const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
-
-    // Two chevrons per leg if the leg is long enough
     const placements = dist > 380 ? [0.45, 0.70] : [0.60];
 
     for (const t of placements) {
@@ -631,57 +790,68 @@ async function addDotsLabelsChevrons({ pngBuffer, displayCoords, routeCoordsForA
       const cy = a.y + dy * t;
 
       overlays.push({
-        input: chevronSvg({ angleDeg, size: 30, opacity: 0.55, colorHex: SLATE }),
+        input: chevronSvg({ angleDeg, size: 30, opacity: 0.70, colorHex: "ffffff" }),
         left: Math.round(cx - 30),
         top: Math.round(cy - 30)
       });
+
       drawnChevrons++;
     }
   }
 
-  // --- LABELS ---
+  // Labels (smaller + collision avoidance)
+  const fontFamily = "Arial, Helvetica, sans-serif";
+  const labelFontSize = 16;
+  const labelOpacity = 0.72;
+
   let drawnLabels = 0;
   const labels = (resolvedPorts || []).map(portLabelText);
 
-  for (let i = 0; i < positions.length; i++) {
-    const p = positions[i];
-    const label = labels[i] || "";
-    if (!label) continue;
+  const placements = placeLabelsNoOverlap({
+    points: displayPositions,
+    labels,
+    view: actualView,
+    fontSize: labelFontSize
+  });
 
-    const labelW = Math.min(Math.max(220, Math.round(label.length * labelFontSize * 0.55)), 980);
-    const labelH = Math.round(labelFontSize * 1.35);
-    const prefer = i % 2 === 0 ? "ur" : "ul";
-    const anchor = labelAnchor({ x: p.x, y: p.y, view: actualView, labelW, labelH, prefer });
+  for (let i = 0; i < placements.length; i++) {
+    const pl = placements[i];
+    if (!pl) continue;
 
     overlays.push({
       input: Buffer.from(`
-        <svg width="${labelW}" height="${labelH}" xmlns="http://www.w3.org/2000/svg">
-          <text x="0" y="${Math.round(labelH * 0.86)}"
+        <svg width="${pl.w}" height="${pl.h}" xmlns="http://www.w3.org/2000/svg">
+          <text x="0" y="${Math.round(pl.h * 0.86)}"
             font-family="${fontFamily}"
             font-weight="600"
             font-size="${labelFontSize}"
+            letter-spacing="0.2"
             fill="#${SLATE}"
             fill-opacity="${labelOpacity}"
             paint-order="stroke"
             stroke="white"
-            stroke-width="4"
+            stroke-width="3.5"
             stroke-opacity="0.82"
-            stroke-linejoin="round">${escapeXml(label)}</text>
+            stroke-linejoin="round">${escapeXml(pl.text)}</text>
         </svg>
       `.trim()),
-      left: anchor.left,
-      top: anchor.top
+      left: pl.left,
+      top: pl.top
     });
 
     drawnLabels++;
   }
 
-  // --- DOTS + STOP NUMBERS (ports-of-call only) ---
-  let drawnDots = 0;
-  const stopNums = makeStopNumbers(positions.length);
+  // Dots + stop numbers (middle only)
+  const haloR = 20;
+  const dotR = 13;
+  const numFontSize = 18;
 
-  for (let i = 0; i < positions.length; i++) {
-    const p = positions[i];
+  const stopNums = makeStopNumbers(displayPositions.length);
+
+  let drawnDots = 0;
+  for (let i = 0; i < displayPositions.length; i++) {
+    const p = displayPositions[i];
     const num = stopNums[i];
     const showNum = Boolean(num);
 
@@ -707,7 +877,7 @@ async function addDotsLabelsChevrons({ pngBuffer, displayCoords, routeCoordsForA
     drawnDots++;
   }
 
-  const out = overlays.length ? await sharp(pngBuffer).composite(overlays).png().toBuffer() : pngBuffer;
+  const out = await sharp(pngBuffer).composite(overlays).png().toBuffer();
 
   return {
     buffer: out,
@@ -717,7 +887,7 @@ async function addDotsLabelsChevrons({ pngBuffer, displayCoords, routeCoordsForA
       drawnChevrons,
       drawnLabels,
       drawnDots,
-      displayStopCount: positions.length
+      displayStopCount: displayPositions.length
     }
   };
 }
@@ -1038,11 +1208,9 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     cleanedPortQueries = finalPorts.map(normalizePortText);
 
-    // Resolve ALL stops
     resolvedAll = [];
     for (const q of cleanedPortQueries) resolvedAll.push(await resolvePort(q));
 
-    // Determine round trip
     const coordsAll = resolvedAll.map((r) => r.coordinates);
     const isRoundTrip =
       (resolvedAll[0]?.portQuery && resolvedAll[resolvedAll.length - 1]?.portQuery &&
@@ -1061,51 +1229,37 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const displayCoords = resolvedDisplay.map((r) => r.coordinates);
 
-    // ROUTE coords: if round trip, we close the loop by adding first coordinate at end
+    // Route coords for arrows & line (close loop in geometry only)
     const routeCoords = (() => {
       const base = displayCoords.slice();
       if (isRoundTrip && base.length >= 2) base.push(base[0]);
       return base;
     })();
 
-    // seed key ensures deterministic “artsy” jitter per itinerary
     const seedKey = `${shipName || ""}|${sailDate || ""}|${cleanedPortQueries.join(" > ")}`;
 
-    // Build map urls
-    const preview = buildBaseMapUrl({
-      displayCoords,
-      routeCoords,
-      width: 1200,
-      height: 800,
-      retina: false,
-      seedKey
-    });
+    // Base map only (no route overlay)
+    const preview = buildBaseOnlyMapUrl({ fitCoords: displayCoords, width: 1200, height: 800, retina: false });
     previewBaseUrl = preview.url;
 
-    const final = buildBaseMapUrl({
-      displayCoords,
-      routeCoords,
-      width: 1280,
-      height: 853,
-      retina: true,
-      seedKey
-    });
+    const final = buildBaseOnlyMapUrl({ fitCoords: displayCoords, width: 1280, height: 853, retina: true });
     finalBaseUrl = final.url;
 
     const basePng = await downloadImageToBuffer(final.url);
 
-    // Chevrons should show for both round-trip and one-way
-    const rendered = await addDotsLabelsChevrons({
+    const rendered = await addRouteMaskedDotsLabelsChevrons({
       pngBuffer: basePng,
       displayCoords,
       routeCoordsForArrows: routeCoords,
+      routeCoordsForLine: routeCoords,
       resolvedPorts: resolvedDisplay,
       view: final.view,
-      isRoundTrip
+      isRoundTrip,
+      seedKey
     });
     renderDebug = rendered.debug;
 
-    // Ensure filename changes EVERY time (prevents Shopify file caching confusion)
+    // unique filename prevents Shopify caching weirdness
     const safeShip = (shipName || "ship").replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "");
     const safeDate = (sailDate || "date").replace(/[^0-9-]+/g, "");
     const uniq = Date.now();
@@ -1150,7 +1304,6 @@ app.post("/webhooks/order-paid", async (req, res) => {
         isRoundTrip,
         cleanedPortQueries,
         displayStops: resolvedDisplay.map((r) => r.portQuery),
-        routeStops: routeCoords,
         previewBaseUrl,
         finalBaseUrl,
         render: renderDebug,
