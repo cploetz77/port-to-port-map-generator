@@ -12,9 +12,8 @@ const geocodeCache = new Map();
 
 app.use(express.json({ limit: "4mb" }));
 
-app.get("/", (req, res) =>
-  res.send("Savvy Cruiser Map Generator is running (GitHub deploy test)")
-);
+app.get("/", (req, res) => res.send("Savvy Cruiser Map Generator is running"));
+
 
 
 app.get("/debug/webhooks", (req, res) => {
