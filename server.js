@@ -1,18 +1,50 @@
+/**
+ * FULL REPLACEMENT server.js
+ * Restores: route line (with safe water-mask fallback), stop numbering (no number for start, 1..N-1 for stops),
+ * keeps: artsy route + white chevrons + non-overlapping port labels + round-trip end dedup.
+ */
+
 const express = require("express");
 const sharp = require("sharp");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Pilot-only: store last webhook events in memory (easy debugging)
-const recentWebhookHits = [];
-
-// Simple in-memory cache for geocoding (saves $$ + avoids jitter)
-const geocodeCache = new Map();
+/* -------------------- RUNTIME SAFETY (fetch/FormData/Blob) -------------------- */
+/**
+ * Render is usually Node 18+ (fetch/FormData/Blob exist).
+ * This keeps you from silently failing if the runtime changes.
+ */
+function assertWebAPIs() {
+  const missing = [];
+  if (typeof fetch !== "function") missing.push("fetch");
+  if (typeof FormData === "undefined") missing.push("FormData");
+  if (typeof Blob === "undefined") missing.push("Blob");
+  if (missing.length) {
+    throw new Error(
+      `Missing web APIs in runtime: ${missing.join(
+        ", "
+      )}. Use Node 18+ or add a fetch polyfill.`
+    );
+  }
+}
+assertWebAPIs();
 
 app.use(express.json({ limit: "4mb" }));
 
-app.get("/", (req, res) => res.send("Savvy Cruiser Map Generator is running"));
+app.get("/", (req, res) =>
+  res.send("Savvy Cruiser Map Generator is running")
+);
+
+/* -------------------- PILOT DEBUG: RECENT WEBHOOK HITS -------------------- */
+
+const recentWebhookHits = [];
+
+/* -------------------- SIMPLE IN-MEMORY CACHE FOR GEOCODING -------------------- */
+
+const geocodeCache = new Map();
+
+/* -------------------- DEBUG ENDPOINT -------------------- */
 
 app.get("/debug/webhooks", (req, res) => {
   res.setHeader("Content-Type", "application/json");
@@ -91,7 +123,20 @@ function toCruiseDateString(yyyyMmDd) {
   const m = parseInt(parts[1], 10);
   const d = parseInt(parts[2], 10);
 
-  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const months = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
   const mon = months[(m || 1) - 1] || "Jan";
   const dd = String(d || 1).padStart(2, "0");
   return `${y} ${mon} ${dd}`;
@@ -130,7 +175,7 @@ const PINNED_PORT_COORDS = {
   "Amber Cove, Dominican Republic": [-70.15, 19.833],
   "Nassau, Bahamas": [-77.355, 25.078],
   "Grand Bahama Island, Bahamas": [-78.65, 26.533],
-  "Celebration Key, Bahamas": [-78.498, 26.57]
+  "Celebration Key, Bahamas": [-78.498, 26.57],
 };
 
 function normalizePortText(raw) {
@@ -148,17 +193,24 @@ function normalizePortText(raw) {
   }
 
   if (lower.includes("port canaveral")) return "Port Canaveral, Florida";
-  if (lower.includes("grand turk")) return "Grand Turk Cruise Center, Turks and Caicos";
-  if (lower.includes("amber cove") || lower.includes("puerto plata-amber cove")) return "Amber Cove, Dominican Republic";
+  if (lower.includes("grand turk"))
+    return "Grand Turk Cruise Center, Turks and Caicos";
+  if (
+    lower.includes("amber cove") ||
+    lower.includes("puerto plata-amber cove")
+  )
+    return "Amber Cove, Dominican Republic";
   if (lower.includes("nassau")) return "Nassau, Bahamas";
-  if (lower.includes("grand bahama")) return "Grand Bahama Island, Bahamas";
+  if (lower.includes("grand bahama"))
+    return "Grand Bahama Island, Bahamas";
 
   return s.replace(/\s+/g, " ").trim();
 }
 
 async function geocodePortFallback(portQuery) {
   const token = process.env.MAPBOX_TOKEN;
-  if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
+  if (!token)
+    throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
 
   const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
@@ -193,7 +245,7 @@ async function geocodePortFallback(portQuery) {
   const result = {
     portQuery,
     placeName: feature.place_name || portQuery,
-    coordinates: center
+    coordinates: center,
   };
 
   geocodeCache.set(cacheKey, result);
@@ -202,7 +254,11 @@ async function geocodePortFallback(portQuery) {
 
 async function resolvePort(portQuery) {
   if (PINNED_PORT_COORDS[portQuery]) {
-    return { portQuery, placeName: portQuery, coordinates: PINNED_PORT_COORDS[portQuery] };
+    return {
+      portQuery,
+      placeName: portQuery,
+      coordinates: PINNED_PORT_COORDS[portQuery],
+    };
   }
   return geocodePortFallback(portQuery);
 }
@@ -229,8 +285,12 @@ function nearlySameCoord(a, b) {
 
 /* -------------------- ROUTE “ARTSY” PATH (SMOOTH + JITTER) -------------------- */
 
-function deg2rad(d) { return (d * Math.PI) / 180; }
-function rad2deg(r) { return (r * 180) / Math.PI; }
+function deg2rad(d) {
+  return (d * Math.PI) / 180;
+}
+function rad2deg(r) {
+  return (r * 180) / Math.PI;
+}
 
 function slerpGreatCircle(a, b, t) {
   const [lng1, lat1] = a.map(deg2rad);
@@ -244,7 +304,7 @@ function slerpGreatCircle(a, b, t) {
   const y2 = Math.cos(lat2) * Math.sin(lng2);
   const z2 = Math.sin(lat2);
 
-  let dot = x1*x2 + y1*y2 + z1*z2;
+  let dot = x1 * x2 + y1 * y2 + z1 * z2;
   dot = Math.max(-1, Math.min(1, dot));
 
   const omega = Math.acos(dot);
@@ -254,11 +314,11 @@ function slerpGreatCircle(a, b, t) {
   const k1 = Math.sin((1 - t) * omega) / sinOmega;
   const k2 = Math.sin(t * omega) / sinOmega;
 
-  const x = k1*x1 + k2*x2;
-  const y = k1*y1 + k2*y2;
-  const z = k1*z1 + k2*z2;
+  const x = k1 * x1 + k2 * x2;
+  const y = k1 * y1 + k2 * y2;
+  const z = k1 * z1 + k2 * z2;
 
-  const lat = Math.atan2(z, Math.sqrt(x*x + y*y));
+  const lat = Math.atan2(z, Math.sqrt(x * x + y * y));
   const lng = Math.atan2(y, x);
 
   return [rad2deg(lng), rad2deg(lat)];
@@ -317,15 +377,17 @@ function jitterRoute(routeCoords, seedKey, amplitudeKm = 9) {
 
     const dx = next[0] - prev[0];
     const dy = next[1] - prev[1];
-    const len = Math.sqrt(dx*dx + dy*dy) || 1e-6;
+    const len = Math.sqrt(dx * dx + dy * dy) || 1e-6;
     const nx = -dy / len;
     const ny = dx / len;
 
     const r = (rnd() - 0.5) * 2;
-    const localAmpKm = amplitudeKm * (0.25 + 0.75 * Math.abs(rnd() - 0.5) * 2);
+    const localAmpKm =
+      amplitudeKm * (0.25 + 0.75 * Math.abs(rnd() - 0.5) * 2);
 
     const dLat = (localAmpKm / 111) * r;
-    const dLng = (localAmpKm / (111 * Math.cos(deg2rad(lat)) || 1)) * r;
+    const dLng =
+      (localAmpKm / (111 * Math.cos(deg2rad(lat)) || 1)) * r;
 
     out.push([lng + nx * dLng, lat + ny * dLat]);
   }
@@ -343,7 +405,10 @@ function lngLatToWorld(lng, lat) {
 }
 
 function computeBounds(coords) {
-  let minLng = 180, maxLng = -180, minLat = 90, maxLat = -90;
+  let minLng = 180,
+    maxLng = -180,
+    minLat = 90,
+    maxLat = -90;
   for (const [lng, lat] of coords) {
     minLng = Math.min(minLng, lng);
     maxLng = Math.max(maxLng, lng);
@@ -550,12 +615,9 @@ function placeLabelsNoOverlap({ points, labels, view, fontSize }) {
   return result;
 }
 
-/* ---------- Stop numbers ---------- */
-/**
+/* ---------- Stop numbers ----------
  * No number for start (index 0).
- * Number every stop AFTER start: 1..(count-1)
- * This matches your example: start is Port Canaveral (no number),
- * then Grand Turk=1, Amber Cove=2, Nassau=3, Celebration Key=4.
+ * Number stops AFTER start: 1..N-1
  */
 function makeStopNumbers(count) {
   const nums = new Array(count).fill("");
@@ -638,11 +700,10 @@ function routeSvgsFromPixelPoints({ width, height, points, seedKey }) {
 
 /**
  * Water mask heuristic for mapbox/light-v11.
- * IMPORTANT: We also compute a coverage ratio and provide a fallback to avoid masking EVERYTHING.
+ * Returns mask + coverage ratio.
  */
 function buildWaterMaskFromBaseMapRGBA(rgba, width, height) {
   const out = Buffer.alloc(width * height * 4, 0);
-
   let waterCount = 0;
 
   for (let i = 0; i < width * height; i++) {
@@ -657,7 +718,7 @@ function buildWaterMaskFromBaseMapRGBA(rgba, width, height) {
     const blueBias = (b - r) + (b - g);
     const bOverRG = (b > r + 6) && (b > g + 4);
 
-    // Slightly looser rules than before (prevents full wipeout)
+    // tuned to be less "wipeout-y"
     const isWater =
       (y > 105 && blueBias > 10) ||
       (y > 130 && bOverRG) ||
@@ -677,6 +738,25 @@ function buildWaterMaskFromBaseMapRGBA(rgba, width, height) {
   return { maskRgba: out, coverage };
 }
 
+/**
+ * Extra safety: if the masked route ends up basically invisible,
+ * fall back to the unmasked route so the line ALWAYS shows.
+ */
+async function estimateAlphaCoverage(pngRgbaBuffer, width, height) {
+  const { data } = await sharp(pngRgbaBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  let nonZero = 0;
+  const total = width * height;
+  for (let i = 0; i < total; i++) {
+    const a = data[i * 4 + 3];
+    if (a > 12) nonZero++;
+  }
+  return nonZero / total;
+}
+
 async function addRouteMaskedDotsLabelsChevrons({
   pngBuffer,
   displayCoords,
@@ -685,7 +765,7 @@ async function addRouteMaskedDotsLabelsChevrons({
   resolvedPorts,
   view,
   isRoundTrip,
-  seedKey
+  seedKey,
 }) {
   const meta = await sharp(pngBuffer).metadata();
   const actualW = meta?.width || view.requestedPixelWidth;
@@ -707,15 +787,20 @@ async function addRouteMaskedDotsLabelsChevrons({
   const arrowPos256 = computePositions({ coords: routeCoordsForArrows, view: actualView, tileSize: 256 });
   const arrowPositions = tileSizeChosen === 256 ? arrowPos256 : arrowPos512;
 
-  // ---- 1) Build water mask from base map pixels, with coverage ----
-  const { data: rgba } = await sharp(pngBuffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  // ---- 1) Build water mask from base map pixels ----
+  const { data: rgba } = await sharp(pngBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
   const { maskRgba: waterMaskRGBA, coverage: waterCoverage } =
     buildWaterMaskFromBaseMapRGBA(rgba, actualW, actualH);
 
   const waterMaskPng = await sharp(waterMaskRGBA, {
-    raw: { width: actualW, height: actualH, channels: 4 }
-  }).png().toBuffer();
+    raw: { width: actualW, height: actualH, channels: 4 },
+  })
+    .png()
+    .toBuffer();
 
   // ---- 2) Build artsy route layer (wash + main) ----
   const dense = densifyRoute(routeCoordsForLine, 22);
@@ -729,11 +814,16 @@ async function addRouteMaskedDotsLabelsChevrons({
     width: actualW,
     height: actualH,
     points: linePositions.map((p) => ({ x: p.x, y: p.y })),
-    seedKey
+    seedKey,
   });
 
   const washLayer = await sharp({
-    create: { width: actualW, height: actualH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+    create: {
+      width: actualW,
+      height: actualH,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
   })
     .composite([{ input: washSvg, left: 0, top: 0 }])
     .png()
@@ -742,32 +832,55 @@ async function addRouteMaskedDotsLabelsChevrons({
   const washBlurred = await sharp(washLayer).blur(2.4).png().toBuffer();
 
   const mainLayer = await sharp({
-    create: { width: actualW, height: actualH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+    create: {
+      width: actualW,
+      height: actualH,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
   })
     .composite([{ input: mainSvg, left: 0, top: 0 }])
     .png()
     .toBuffer();
 
   const routeLayer = await sharp({
-    create: { width: actualW, height: actualH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
+    create: {
+      width: actualW,
+      height: actualH,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
   })
     .composite([
       { input: washBlurred, left: 0, top: 0 },
-      { input: mainLayer, left: 0, top: 0 }
+      { input: mainLayer, left: 0, top: 0 },
     ])
     .png()
     .toBuffer();
 
-  // ---- 3) Mask route so it "goes behind land", BUT add fallback if mask is too aggressive ----
-  // If coverage is suspiciously low, do NOT mask (prevents missing line).
-  const shouldMask = waterCoverage > 0.10; // loose guard; Caribbean maps typically have plenty of water
+  // ---- 3) Mask route so it "goes behind land", BUT with safe fallback ----
+  // First guard: if coverage is suspiciously low, do NOT mask.
+  const coverageLooksOk = waterCoverage > 0.10;
 
-  const routeMasked = shouldMask
-    ? await sharp(routeLayer)
-        .composite([{ input: waterMaskPng, left: 0, top: 0, blend: "dest-in" }])
-        .png()
-        .toBuffer()
-    : routeLayer;
+  let routeMasked = routeLayer;
+  let maskedEnabled = false;
+
+  if (coverageLooksOk) {
+    routeMasked = await sharp(routeLayer)
+      .composite([{ input: waterMaskPng, left: 0, top: 0, blend: "dest-in" }])
+      .png()
+      .toBuffer();
+
+    maskedEnabled = true;
+
+    // Second guard: if masking makes the route basically disappear, fall back.
+    const alphaCov = await estimateAlphaCoverage(routeMasked, actualW, actualH);
+    // If fewer than ~0.25% pixels have meaningful alpha, it's likely "all masked away".
+    if (alphaCov < 0.0025) {
+      routeMasked = routeLayer;
+      maskedEnabled = false; // effectively disabled due to invisibility
+    }
+  }
 
   // ---- 4) Composite route + chevrons + labels + dots ----
   const overlays = [];
@@ -781,7 +894,7 @@ async function addRouteMaskedDotsLabelsChevrons({
 
     const dx = b.x - a.x;
     const dy = b.y - a.y;
-    const dist = Math.sqrt(dx*dx + dy*dy);
+    const dist = Math.sqrt(dx * dx + dy * dy);
     if (!Number.isFinite(dist) || dist < 60) continue;
 
     const angleDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
@@ -794,7 +907,7 @@ async function addRouteMaskedDotsLabelsChevrons({
       overlays.push({
         input: chevronSvg({ angleDeg, size: 30, opacity: 0.72, colorHex: "ffffff" }),
         left: Math.round(cx - 30),
-        top: Math.round(cy - 30)
+        top: Math.round(cy - 30),
       });
       drawnChevrons++;
     }
@@ -812,7 +925,7 @@ async function addRouteMaskedDotsLabelsChevrons({
     points: displayPositions,
     labels,
     view: actualView,
-    fontSize: labelFontSize
+    fontSize: labelFontSize,
   });
 
   for (let i = 0; i < placements.length; i++) {
@@ -837,13 +950,13 @@ async function addRouteMaskedDotsLabelsChevrons({
         </svg>
       `.trim()),
       left: pl.left,
-      top: pl.top
+      top: pl.top,
     });
 
     drawnLabels++;
   }
 
-  // Dots + stop numbers (no number for start, numbers for all ports after start)
+  // Dots + stop numbers
   const haloR = 20;
   const dotR = 13;
   const numFontSize = 16;
@@ -877,7 +990,7 @@ async function addRouteMaskedDotsLabelsChevrons({
         </svg>
       `.trim()),
       left: Math.round(p.x - haloR),
-      top: Math.round(p.y - haloR)
+      top: Math.round(p.y - haloR),
     });
 
     drawnDots++;
@@ -896,9 +1009,9 @@ async function addRouteMaskedDotsLabelsChevrons({
       displayStopCount: displayPositions.length,
       waterMask: {
         coverage: Number(waterCoverage.toFixed(4)),
-        maskedEnabled: shouldMask
-      }
-    }
+        maskedEnabled,
+      },
+    },
   };
 }
 
@@ -919,9 +1032,9 @@ async function shopifyGraphQL(query, variables) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Access-Token": adminToken
+      "X-Shopify-Access-Token": adminToken,
     },
-    body: JSON.stringify({ query, variables })
+    body: JSON.stringify({ query, variables }),
   });
 
   const json = await resp.json();
@@ -981,7 +1094,7 @@ async function uploadPngToShopifyFiles({ buffer, filename }) {
   `;
 
   const fileCreateVars = {
-    files: [{ contentType: "IMAGE", originalSource: target.resourceUrl, alt: "Cruise route map" }]
+    files: [{ contentType: "IMAGE", originalSource: target.resourceUrl, alt: "Cruise route map" }],
   };
 
   const fileCreateData = await shopifyGraphQL(fileCreateQuery, fileCreateVars);
@@ -1054,13 +1167,15 @@ async function setOrderMetafieldMapUrl({ orderId, mapUrl }) {
   `;
 
   const vars = {
-    metafields: [{
-      ownerId: gid,
-      namespace: "port_to_port",
-      key: "map_url",
-      type: "single_line_text_field",
-      value: String(mapUrl || "")
-    }]
+    metafields: [
+      {
+        ownerId: gid,
+        namespace: "port_to_port",
+        key: "map_url",
+        type: "single_line_text_field",
+        value: String(mapUrl || ""),
+      },
+    ],
   };
 
   const data = await shopifyGraphQL(query, vars);
@@ -1076,7 +1191,8 @@ async function sendEmailViaResend({ to, subject, html, text }) {
   const from = process.env.EMAIL_FROM;
   const bcc = process.env.EMAIL_BCC;
 
-  if (!apiKey || !from) return { sent: false, skipped: true, reason: "Email paused (missing RESEND_API_KEY or EMAIL_FROM)" };
+  if (!apiKey || !from)
+    return { sent: false, skipped: true, reason: "Email paused (missing RESEND_API_KEY or EMAIL_FROM)" };
   if (!to) return { sent: false, skipped: true, reason: "Missing recipient email" };
 
   const payload = { from, to, subject, html, text };
@@ -1085,7 +1201,7 @@ async function sendEmailViaResend({ to, subject, html, text }) {
   const resp = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
 
   const json = await resp.json().catch(() => ({}));
@@ -1110,14 +1226,14 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
     departure_port: "",
     destination: "0",
     ship_type: "0",
-    port_of_call: ""
+    port_of_call: "",
   };
 
   const runUrl = `https://api.apify.com/v2/actor-tasks/${taskId}/runs?token=${token}&waitForFinish=120`;
   const runResp = await fetch(runUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(input)
+    body: JSON.stringify(input),
   });
 
   if (!runResp.ok) {
@@ -1158,8 +1274,8 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
     chosenMeta: {
       id: chosen.id || null,
       cruise_date: chosen.cruise_date || null,
-      cruise_title: chosen.cruise_title || null
-    }
+      cruise_title: chosen.cruise_title || null,
+    },
   };
 }
 
@@ -1223,7 +1339,8 @@ app.post("/webhooks/order-paid", async (req, res) => {
 
     const coordsAll = resolvedAll.map((r) => r.coordinates);
     const isRoundTrip =
-      (resolvedAll[0]?.portQuery && resolvedAll[resolvedAll.length - 1]?.portQuery &&
+      (resolvedAll[0]?.portQuery &&
+        resolvedAll[resolvedAll.length - 1]?.portQuery &&
         resolvedAll[0].portQuery === resolvedAll[resolvedAll.length - 1].portQuery) ||
       (coordsAll.length >= 2 && nearlySameCoord(coordsAll[0], coordsAll[coordsAll.length - 1]));
 
@@ -1242,7 +1359,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
     // Route coords for arrows & line (close loop in geometry only)
     const routeCoords = (() => {
       const base = displayCoords.slice();
-      if (isRoundTrip && base.length >= 2) base.push(base[0]);
+      if (isRoundTrip && base.length >= 2) base.push(base[0]); // close loop for the line/chevrons only
       return base;
     })();
 
@@ -1265,7 +1382,7 @@ app.post("/webhooks/order-paid", async (req, res) => {
       resolvedPorts: resolvedDisplay,
       view: final.view,
       isRoundTrip,
-      seedKey
+      seedKey,
     });
     renderDebug = rendered.debug;
 
@@ -1302,7 +1419,11 @@ app.post("/webhooks/order-paid", async (req, res) => {
       emailResult = await sendEmailViaResend({ to: customerEmail, subject, html, text });
       emailSent = Boolean(emailResult?.sent);
     } else {
-      emailResult = { sent: false, skipped: true, reason: !shopifyFileUrl ? "No shopifyFileUrl" : "No customer email" };
+      emailResult = {
+        sent: false,
+        skipped: true,
+        reason: !shopifyFileUrl ? "No shopifyFileUrl" : "No customer email",
+      };
     }
 
     const entry = {
@@ -1316,9 +1437,14 @@ app.post("/webhooks/order-paid", async (req, res) => {
         previewBaseUrl,
         finalBaseUrl,
         render: renderDebug,
-        shopifyFileUrl
+        shopifyFileUrl,
       },
-      delivery: { wroteOrderNote: orderNoteWritten, wroteMetafield: metafieldWritten, emailSent, emailResult }
+      delivery: {
+        wroteOrderNote: orderNoteWritten,
+        wroteMetafield: metafieldWritten,
+        emailSent,
+        emailResult,
+      },
     };
 
     recentWebhookHits.unshift(entry);
@@ -1329,10 +1455,11 @@ app.post("/webhooks/order-paid", async (req, res) => {
     recentWebhookHits.unshift({
       at: new Date().toISOString(),
       error: String(err?.message || err),
-      map: { previewBaseUrl, finalBaseUrl, render: renderDebug, shopifyFileUrl }
+      map: { previewBaseUrl, finalBaseUrl, render: renderDebug, shopifyFileUrl },
     });
     if (recentWebhookHits.length > 20) recentWebhookHits.pop();
 
+    // Always 200 so Shopify doesn't keep retrying forever while you're iterating.
     res.status(200).send("OK");
   }
 });
