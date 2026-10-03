@@ -1279,6 +1279,92 @@ async function runApifyTaskAndGetPorts({ cruiseLine, shipName, sailDate }) {
   };
 }
 
+
+/* -------------------- INTERNAL MCO CLIENT MAP REDEMPTION -------------------- */
+
+function safeSecretEqual(a, b) {
+  const x = Buffer.from(String(a || ""));
+  const y = Buffer.from(String(b || ""));
+  if (!x.length || x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+app.post("/internal/mco-map", async (req, res) => {
+  try {
+    const expected = process.env.MCO_MAP_REDEEM_TOKEN || "";
+    const provided = req.get("x-mco-map-token") || "";
+    if (!safeSecretEqual(expected, provided)) return res.status(401).json({ error: "unauthorized" });
+
+    const cruiseLine = String(req.body?.cruiseLine || "").trim().slice(0, 160);
+    const shipName = String(req.body?.shipName || "").trim().slice(0, 160);
+    const sailDate = normalizeDateToYyyyMmDd(String(req.body?.sailDate || "").trim());
+    const rawPorts = Array.isArray(req.body?.ports) ? req.body.ports : [];
+    const finalPorts = rawPorts.map((p) => String(p || "").trim().slice(0, 180)).filter(Boolean).slice(0, 30);
+    if (!shipName || !sailDate || finalPorts.length < 2) {
+      return res.status(422).json({ error: "valid_ship_date_and_ports_required" });
+    }
+
+    const cleanedPortQueries = finalPorts.map(normalizePortText);
+    const resolvedAll = [];
+    for (const q of cleanedPortQueries) resolvedAll.push(await resolvePort(q));
+
+    const coordsAll = resolvedAll.map((r) => r.coordinates);
+    const isRoundTrip =
+      (resolvedAll[0]?.portQuery &&
+        resolvedAll[resolvedAll.length - 1]?.portQuery &&
+        resolvedAll[0].portQuery === resolvedAll[resolvedAll.length - 1].portQuery) ||
+      (coordsAll.length >= 2 && nearlySameCoord(coordsAll[0], coordsAll[coordsAll.length - 1]));
+
+    let resolvedDisplay = resolvedAll.slice();
+    if (isRoundTrip && resolvedDisplay.length >= 2) {
+      const last = resolvedDisplay[resolvedDisplay.length - 1];
+      const first = resolvedDisplay[0];
+      if (last.portQuery === first.portQuery || nearlySameCoord(last.coordinates, first.coordinates)) {
+        resolvedDisplay = resolvedDisplay.slice(0, -1);
+      }
+    }
+
+    const displayCoords = resolvedDisplay.map((r) => r.coordinates);
+    const routeCoords = displayCoords.slice();
+    if (isRoundTrip && routeCoords.length >= 2) routeCoords.push(routeCoords[0]);
+    const seedKey = `${shipName}|${sailDate}|${cleanedPortQueries.join(" > ")}`;
+
+    const final = buildBaseOnlyMapUrl({ fitCoords: displayCoords, width: 1280, height: 853, retina: true });
+    const basePng = await downloadImageToBuffer(final.url);
+    const rendered = await addRouteMaskedDotsLabelsChevrons({
+      pngBuffer: basePng,
+      displayCoords,
+      routeCoordsForArrows: routeCoords,
+      routeCoordsForLine: routeCoords,
+      resolvedPorts: resolvedDisplay,
+      view: final.view,
+      isRoundTrip,
+      seedKey,
+    });
+
+    const safeShip = shipName.replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "") || "ship";
+    const safeDate = sailDate.replace(/[^0-9-]+/g, "") || "date";
+    const filename = `mco-client-map-${safeShip}-${safeDate}-${Date.now()}.png`;
+    const uploaded = await uploadPngToShopifyFiles({ buffer: rendered.buffer, filename });
+    if (!uploaded?.url) throw new Error("Map upload did not return a download URL.");
+
+    return res.status(200).json({
+      ok: true,
+      url: uploaded.url,
+      cruiseLine,
+      shipName,
+      sailDate,
+      ports: cleanedPortQueries,
+      render: rendered.debug,
+    });
+  } catch (err) {
+    console.error("mco client map generation failed", String(err?.message || err));
+    return res.status(502).json({ error: "map_generation_failed" });
+  }
+});
+
 /* -------------------- WEBHOOK -------------------- */
 
 app.post("/webhooks/order-paid", async (req, res) => {
