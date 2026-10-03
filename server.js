@@ -209,47 +209,38 @@ function normalizePortText(raw) {
 
 async function geocodePortFallback(portQuery) {
   const token = process.env.MAPBOX_TOKEN;
-  if (!token)
-    throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
+  if (!token) throw new Error("Missing MAPBOX_TOKEN in Render environment variables.");
 
-  const cacheKey = `bbox:${portQuery.toLowerCase().trim()}`;
+  const cacheKey = `global:${portQuery.toLowerCase().trim()}`;
   if (geocodeCache.has(cacheKey)) return geocodeCache.get(cacheKey);
 
-  // Caribbean-ish bbox/proximity for cruise routes
-  const bbox = "-90,17,-55,32";
-  const proximity = "-75,23.5";
-
   const query = encodeURIComponent(portQuery);
-  const url =
-    `https://api.mapbox.com/geocoding/v5/mapbox.places/${query}.json` +
-    `?access_token=${token}` +
-    `&limit=1` +
-    `&types=poi,place,locality` +
-    `&bbox=${bbox}` +
-    `&proximity=${proximity}`;
+  const attempts = [
+    `https://api.mapbox.com/geocoding/v5/mapbox.places/${query}.json?access_token=${token}&limit=1&types=poi,place,locality&bbox=-90,17,-55,32&proximity=-75,23.5`,
+    `https://api.mapbox.com/geocoding/v5/mapbox.places/${query}.json?access_token=${token}&limit=1&types=poi,place,locality,district,region`,
+  ];
 
-  const resp = await fetch(url);
-  if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(`Mapbox geocoding failed: ${resp.status} ${t}`);
+  let lastStatus = "";
+  for (const url of attempts) {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      lastStatus = String(resp.status);
+      continue;
+    }
+    const data = await resp.json();
+    const feature = data?.features?.[0];
+    const center = feature?.center;
+    if (!Array.isArray(center) || center.length !== 2) continue;
+    const result = {
+      portQuery,
+      placeName: feature.place_name || portQuery,
+      coordinates: center,
+    };
+    geocodeCache.set(cacheKey, result);
+    return result;
   }
 
-  const data = await resp.json();
-  const feature = data?.features?.[0];
-  const center = feature?.center;
-
-  if (!Array.isArray(center) || center.length !== 2) {
-    throw new Error(`No geocoding result (bbox) for: ${portQuery}`);
-  }
-
-  const result = {
-    portQuery,
-    placeName: feature.place_name || portQuery,
-    coordinates: center,
-  };
-
-  geocodeCache.set(cacheKey, result);
-  return result;
+  throw new Error(`No geocoding result for: ${portQuery}${lastStatus ? ` (last HTTP ${lastStatus})` : ""}`);
 }
 
 async function resolvePort(portQuery) {
